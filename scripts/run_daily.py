@@ -21,18 +21,16 @@ async def fetch_county_rows():
 
         frames = [page.main_frame] + list(page.frames)
 
-        # 1) Find a date dropdown in any frame
+        # Find date dropdown
         date_select = None
-        frame_with_form = None
         for fr in frames:
             sel = fr.locator("select")
             if await sel.count() > 0:
                 date_select = sel.first
-                frame_with_form = fr
                 break
 
         if date_select is None:
-            raise RuntimeError("No <select> dropdown found on page/frames.")
+            raise RuntimeError("No date dropdown found")
 
         options = await date_select.locator("option").all_inner_texts()
 
@@ -44,70 +42,37 @@ async def fetch_county_rows():
                 break
 
         if not chosen:
-            for opt in options:
-                if opt.strip().lower() == "all":
-                    chosen = "All"
-                    break
-
-        if not chosen:
-            preview = ", ".join([o.strip() for o in options[:8]])
-            raise RuntimeError(f"Could not find date option. First options: {preview}")
+            chosen = "All"
 
         await date_select.select_option(label=chosen)
 
-        # 2) Click Search (in same frame as the dropdown)
-        fr_for_controls = frame_with_form or page.main_frame
-        await page.wait_for_timeout(1500)
-
-        candidates = [
-            fr_for_controls.locator("input[type=submit]"),
-            fr_for_controls.locator("input[type=button]"),
-            fr_for_controls.locator("button"),
-            fr_for_controls.locator("input"),
-        ]
-
-        search_btn = None
-        for loc in candidates:
-            if await loc.count() == 0:
-                continue
-            for i in range(await loc.count()):
-                el = loc.nth(i)
-                val = (await el.get_attribute("value")) or ""
-                name = (await el.get_attribute("name")) or ""
-                _id = (await el.get_attribute("id")) or ""
-                blob = f"{val} {name} {_id}".lower()
-                if "search" in blob or "submit" in blob or blob.strip() == "go":
-                    search_btn = el
-                    break
-            if search_btn:
-                break
-
-         form = date_select.locator("xpath=ancestor::form[1]")
+        # Submit the surrounding form (old ASP-safe)
+        form = date_select.locator("xpath=ancestor::form[1]")
         if await form.count() == 0:
-            raise RuntimeError("Could not find a <form> to submit.")
+            raise RuntimeError("Form not found for dropdown")
+
         await form.evaluate("f => f.submit()")
         await page.wait_for_load_state("networkidle")
 
-        # Refresh frames after form submission
         frames = [page.main_frame] + list(page.frames)
 
-        # 3) Find the results table (avoid the search UI)
-        best = None
+        # Find results table
+        table = None
         for fr in frames:
             for t in await fr.query_selector_all("table"):
                 ths = await t.query_selector_all("th")
-                hdr = " | ".join([(await h.inner_text()).strip() for h in ths]).upper()
-                if any(k in hdr for k in ["PERMIT", "ADDRESS", "ISSU", "DESCRIPTION"]) and "SELECT DATE" not in hdr:
-                    best = t
+                header = " ".join([(await h.inner_text()).upper() for h in ths])
+                if "PERMIT" in header and "ADDRESS" in header:
+                    table = t
                     break
-            if best:
+            if table:
                 break
 
-        if not best:
-            raise RuntimeError("No permit results table found after Search.")
+        if table is None:
+            raise RuntimeError("Permit results table not found")
 
         rows = []
-        trs = await best.query_selector_all("tr")
+        trs = await table.query_selector_all("tr")
         for tr in trs[1:]:
             tds = await tr.query_selector_all("td")
             if not tds:
@@ -118,15 +83,12 @@ async def fetch_county_rows():
         await browser.close()
         return chosen, rows
 
-def debris_signal(desc: str):
+def debris_signal(desc):
     d = (desc or "").upper()
-    hits = []
-    for k in ["DEMO", "DEMOL", "TEAR", "ROOF", "REMODEL", "RENOV", "ADDITION", "CONCRETE", "REMOVE"]:
+    for k in ["DEMO", "ROOF", "TEAR", "REMOVE", "REMODEL", "RENOV"]:
         if k in d:
-            hits.append(k)
-    if not hits:
-        return []
-    return [{"name": "debris_generation", "confidence": 0.7, "evidence": hits[:4]}]
+            return [{"name": "debris_generation", "confidence": 0.7}]
+    return []
 
 async def main():
     run_date = datetime.now(timezone.utc).date().isoformat()
@@ -134,41 +96,33 @@ async def main():
 
     chosen_date, rows = await fetch_county_rows()
 
-    # Debug (temporary): helps us lock column mapping fast
-    print("Chosen date:", chosen_date)
-    print("Sample row:", rows[0] if rows else "NO ROWS")
-
     out = []
     for cells in rows:
-        issued_date = chosen_date  # will map to real column once confirmed
         address = cells[1] if len(cells) > 1 else ""
-        desc = cells[2] if len(cells) > 2 else " ".join(cells)
+        desc = cells[2] if len(cells) > 2 else ""
 
         rec = {
             "source": "county",
             "jurisdiction": "Greenville County",
-            "issued_date": issued_date,
+            "issued_date": chosen_date,
             "project": {
                 "address": address,
                 "description": desc,
                 "permit_type": None,
                 "value": None
             },
-            "contractor": {"name": None, "phone": None, "license": None},
-            "owner": {"name": None, "address": None},
             "signals": debris_signal(desc),
-            "fingerprint": fp(issued_date or "", address or "", desc or ""),
+            "fingerprint": fp(chosen_date, address, desc),
             "source_url": COUNTY_URL,
-            "scraped_at": now_iso(),
-            "confidence": 0.6
+            "scraped_at": now_iso()
         }
         out.append(rec)
 
     path = f"data/{run_date}.json"
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+        json.dump(out, f, indent=2)
 
-    print(f"Wrote {len(out)} records -> {path}")
+    print(f"Wrote {len(out)} records")
 
 if __name__ == "__main__":
     asyncio.run(main())
