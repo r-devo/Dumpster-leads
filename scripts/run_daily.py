@@ -19,22 +19,49 @@ async def fetch_county_rows():
         await page.goto(COUNTY_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # find a permit-like table in any frame
+        # 1) Pick a date from the dropdown (prefer most recent non-"All"/non-placeholder)
+        date_select = page.locator("select").filter(has_text="Select Date").first
+        if await date_select.count() == 0:
+            # fallback: any select on page
+            date_select = page.locator("select").first
+
+        options = await date_select.locator("option").all_inner_texts()
+        # choose first "real" option
+        chosen = None
+        for opt in options:
+            t = opt.strip()
+            if not t or t.lower() in {"select date", "all"}:
+                continue
+            chosen = t
+            break
+        if not chosen:
+            raise RuntimeError("Could not find a real date option in dropdown.")
+
+        await date_select.select_option(label=chosen)
+
+        # 2) Click Search
+        search_btn = page.locator("input[type=submit], input[type=button], button").filter(has_text="Search").first
+        if await search_btn.count() == 0:
+            search_btn = page.locator("input").filter(has_text="Search").first
+        await search_btn.click()
+        await page.wait_for_load_state("networkidle")
+
+        # 3) Find the *results* table (not the search form)
         frames = [page.main_frame] + list(page.frames)
         best = None
         for fr in frames:
             for t in await fr.query_selector_all("table"):
                 ths = await t.query_selector_all("th")
                 hdr = " | ".join([(await h.inner_text()).strip() for h in ths]).upper()
-                if any(k in hdr for k in ["PERMIT", "ADDRESS", "ISSU", "DESCRIPTION", "TYPE"]):
+                # Must look like permit results AND must NOT look like the search UI
+                if any(k in hdr for k in ["PERMIT", "ADDRESS", "ISSU", "DESCRIPTION"]) and "SELECT DATE" not in hdr:
                     best = t
                     break
             if best:
                 break
 
         if not best:
-            await browser.close()
-            raise RuntimeError("No permit-like table found.")
+            raise RuntimeError("No permit results table found after Search (layout changed).")
 
         rows = []
         trs = await best.query_selector_all("tr")
@@ -46,7 +73,7 @@ async def fetch_county_rows():
             rows.append(cells)
 
         await browser.close()
-        return rows
+        return chosen, rows
 
 def debris_signal(desc: str):
     d = (desc or "").upper()
@@ -62,12 +89,12 @@ async def main():
     run_date = datetime.now(timezone.utc).date().isoformat()
     os.makedirs("data", exist_ok=True)
 
-    rows = await fetch_county_rows()
+    chosen_date, rows = await fetch_county_rows()
 
     out = []
     for cells in rows:
         # best-effort: these indexes get refined after we inspect real columns
-        issued_date = None
+        issued_date = chosen_date
         address = cells[1] if len(cells) > 1 else ""
         desc = cells[2] if len(cells) > 2 else " ".join(cells)
 
