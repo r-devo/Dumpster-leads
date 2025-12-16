@@ -20,22 +20,40 @@ async def fetch_county_rows():
         await page.wait_for_load_state("networkidle")
 
         # 1) Pick a date from the dropdown (prefer most recent non-"All"/non-placeholder)
-        date_select = page.locator("select").filter(has_text="Select Date").first
-        if await date_select.count() == 0:
-            # fallback: any select on page
-            date_select = page.locator("select").first
+                # 1) Find a date dropdown in any frame
+        frames = [page.main_frame] + list(page.frames)
+        date_select = None
+
+        for fr in frames:
+            sel = fr.locator("select")
+            if await sel.count() > 0:
+                date_select = sel.first
+                break
+
+        if date_select is None:
+            raise RuntimeError("No <select> dropdown found on page/frames.")
 
         options = await date_select.locator("option").all_inner_texts()
-        # choose first "real" option
+
+        # Choose first option that looks like MM/DD/YYYY
         chosen = None
         for opt in options:
             t = opt.strip()
-            if not t or t.lower() in {"select date", "all"}:
-                continue
-            chosen = t
-            break
+            if len(t) == 10 and t[2] == "/" and t[5] == "/":
+                chosen = t
+                break
+
+        # Fallback: if no date options, try 'All' if present
         if not chosen:
-            raise RuntimeError("Could not find a real date option in dropdown.")
+            for opt in options:
+                if opt.strip().lower() == "all":
+                    chosen = "All"
+                    break
+
+        if not chosen:
+            # Debug help: include first few options so we can see what the dropdown contains
+            preview = ", ".join([o.strip() for o in options[:8]])
+            raise RuntimeError(f"Could not find date option. First options: {preview}")
 
         await date_select.select_option(label=chosen)
 
