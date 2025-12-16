@@ -82,10 +82,10 @@ async def fetch_county_rows():
             if search_btn:
                 break
 
-        if not search_btn:
-            raise RuntimeError("Could not locate Search/Submit control.")
-
-        await search_btn.click(timeout=60000)
+         form = date_select.locator("xpath=ancestor::form[1]")
+        if await form.count() == 0:
+            raise RuntimeError("Could not find a <form> to submit.")
+        await form.evaluate("f => f.submit()")
         await page.wait_for_load_state("networkidle")
 
         # Refresh frames after form submission
