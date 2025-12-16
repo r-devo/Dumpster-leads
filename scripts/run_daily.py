@@ -19,15 +19,16 @@ async def fetch_county_rows():
         await page.goto(COUNTY_URL, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle")
 
-        # 1) Pick a date from the dropdown (prefer most recent non-"All"/non-placeholder)
-                # 1) Find a date dropdown in any frame
         frames = [page.main_frame] + list(page.frames)
-        date_select = None
 
+        # 1) Find a date dropdown in any frame
+        date_select = None
+        frame_with_form = None
         for fr in frames:
             sel = fr.locator("select")
             if await sel.count() > 0:
                 date_select = sel.first
+                frame_with_form = fr
                 break
 
         if date_select is None:
@@ -35,7 +36,6 @@ async def fetch_county_rows():
 
         options = await date_select.locator("option").all_inner_texts()
 
-        # Choose first option that looks like MM/DD/YYYY
         chosen = None
         for opt in options:
             t = opt.strip()
@@ -43,7 +43,6 @@ async def fetch_county_rows():
                 chosen = t
                 break
 
-        # Fallback: if no date options, try 'All' if present
         if not chosen:
             for opt in options:
                 if opt.strip().lower() == "all":
@@ -51,27 +50,53 @@ async def fetch_county_rows():
                     break
 
         if not chosen:
-            # Debug help: include first few options so we can see what the dropdown contains
             preview = ", ".join([o.strip() for o in options[:8]])
             raise RuntimeError(f"Could not find date option. First options: {preview}")
 
         await date_select.select_option(label=chosen)
 
-        # 2) Click Search
-        search_btn = page.locator("input[type=submit], input[type=button], button").filter(has_text="Search").first
-        if await search_btn.count() == 0:
-            search_btn = page.locator("input").filter(has_text="Search").first
-        await search_btn.click()
+        # 2) Click Search (in same frame as the dropdown)
+        fr_for_controls = frame_with_form or page.main_frame
+        await page.wait_for_timeout(1500)
+
+        candidates = [
+            fr_for_controls.locator("input[type=submit]"),
+            fr_for_controls.locator("input[type=button]"),
+            fr_for_controls.locator("button"),
+            fr_for_controls.locator("input"),
+        ]
+
+        search_btn = None
+        for loc in candidates:
+            if await loc.count() == 0:
+                continue
+            for i in range(await loc.count()):
+                el = loc.nth(i)
+                val = (await el.get_attribute("value")) or ""
+                name = (await el.get_attribute("name")) or ""
+                _id = (await el.get_attribute("id")) or ""
+                blob = f"{val} {name} {_id}".lower()
+                if "search" in blob or "submit" in blob or blob.strip() == "go":
+                    search_btn = el
+                    break
+            if search_btn:
+                break
+
+        if not search_btn:
+            raise RuntimeError("Could not locate Search/Submit control.")
+
+        await search_btn.click(timeout=60000)
         await page.wait_for_load_state("networkidle")
 
-        # 3) Find the *results* table (not the search form)
+        # Refresh frames after form submission
         frames = [page.main_frame] + list(page.frames)
+
+        # 3) Find the results table (avoid the search UI)
         best = None
         for fr in frames:
             for t in await fr.query_selector_all("table"):
                 ths = await t.query_selector_all("th")
                 hdr = " | ".join([(await h.inner_text()).strip() for h in ths]).upper()
-                # Must look like permit results AND must NOT look like the search UI
                 if any(k in hdr for k in ["PERMIT", "ADDRESS", "ISSU", "DESCRIPTION"]) and "SELECT DATE" not in hdr:
                     best = t
                     break
@@ -79,7 +104,7 @@ async def fetch_county_rows():
                 break
 
         if not best:
-            raise RuntimeError("No permit results table found after Search (layout changed).")
+            raise RuntimeError("No permit results table found after Search.")
 
         rows = []
         trs = await best.query_selector_all("tr")
@@ -109,10 +134,13 @@ async def main():
 
     chosen_date, rows = await fetch_county_rows()
 
+    # Debug (temporary): helps us lock column mapping fast
+    print("Chosen date:", chosen_date)
+    print("Sample row:", rows[0] if rows else "NO ROWS")
+
     out = []
     for cells in rows:
-        # best-effort: these indexes get refined after we inspect real columns
-        issued_date = chosen_date
+        issued_date = chosen_date  # will map to real column once confirmed
         address = cells[1] if len(cells) > 1 else ""
         desc = cells[2] if len(cells) > 2 else " ".join(cells)
 
