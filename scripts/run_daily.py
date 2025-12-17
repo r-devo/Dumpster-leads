@@ -15,29 +15,18 @@ def fp(issued_date, permit_no, address, desc):
     return hashlib.sha256(base).hexdigest()
 
 def local_yesterday_mmddyyyy():
-    # Good enough for Greenville “yesterday” in practice
+    # Server/user is Eastern; this is fine for “yesterday”
     return (datetime.now() - timedelta(days=1)).strftime("%m/%d/%Y")
 
-def debris_signal(text: str):
-    d = (text or "").upper()
-    hits = []
-    for k in ["DEMO", "DEMOL", "TEAR", "ROOF", "REMODEL", "RENOV", "ADDITION", "CONCRETE", "REMOVE", "EXCAV", "NEW CONSTRUCTION"]:
-        if k in d:
-            hits.append(k)
-    return [{"name": "debris_generation", "confidence": 0.7, "evidence": hits[:4]}] if hits else []
-
-async def snap(page, name: str):
+async def snap(page, stem: str):
     os.makedirs("data", exist_ok=True)
     try:
-        await page.screenshot(path=f"data/{name}.png", full_page=True)
+        await page.screenshot(path=f"data/{stem}.png", full_page=True)
     except Exception:
         pass
-
-async def dump_html(page, name: str):
-    os.makedirs("data", exist_ok=True)
     try:
         html = await page.content()
-        with open(f"data/{name}.html", "w", encoding="utf-8") as f:
+        with open(f"data/{stem}.html", "w", encoding="utf-8") as f:
             f.write(html)
     except Exception:
         pass
@@ -45,220 +34,195 @@ async def dump_html(page, name: str):
 async def login(page, username: str, password: str):
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(800)
+    await snap(page, "00_loaded")
 
-    # robust-ish field finds
-    user = page.locator("input[type='email'], input[type='text']").first
-    pw = page.locator("input[type='password']").first
+    # IMPORTANT: only fill VISIBLE fields (hidden inputs cause your exact failure)
+    user = page.locator("input[type='email']:visible, input[type='text']:visible").first
+    pw = page.locator("input[type='password']:visible").first
+
+    await user.wait_for(state="visible", timeout=30000)
+    await pw.wait_for(state="visible", timeout=30000)
+
     await user.fill(username)
     await pw.fill(password)
 
-    btn = page.locator("button, input[type=submit]").filter(
-        has_text=re.compile(r"log\s*in|sign\s*in", re.I)
-    ).first
+    # Click a visible login-ish button
+    btn = page.locator(
+        "button:visible, input[type='submit']:visible, input[type='button']:visible"
+    ).filter(has_text=re.compile(r"(log\s*in|sign\s*in|login)", re.I)).first
+
+    # Fallback: first visible submit/button
     if await btn.count() == 0:
-        btn = page.locator("button, input[type=submit], input[type=button]").first
+        btn = page.locator("input[type='submit']:visible, button:visible, input[type='button']:visible").first
 
     await btn.click()
     await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(800)
+    await snap(page, "10_after_login")
 
-async def find_results_table(page):
-    # Find table with headers matching the screenshot
-    tables = page.locator("table")
-    n = await tables.count()
-    best = None
-    best_hdr = []
-    for i in range(n):
-        t = tables.nth(i)
-        ths = t.locator("th")
-        if await ths.count() == 0:
-            continue
-        hdr = [h.strip() for h in await ths.all_inner_texts()]
-        hdr_u = [h.upper() for h in hdr]
-        if ("PERMIT_NO" in hdr_u or "PERMIT NO" in hdr_u) and "ISSUED" in hdr_u:
-            best = t
-            best_hdr = hdr
-            break
-    return best, best_hdr
+async def run_search(page):
+    # Go directly to permit search
+    await page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(800)
+    await snap(page, "20_search_loaded")
 
-async def parse_current_page_rows(table):
+    # Fill the 3-field search:
+    # Search By: ISSUED
+    # Operator: Equals
+    # Value: yesterday
+    issued = local_yesterday_mmddyyyy()
+
+    # These selects are usually visible; still enforce :visible
+    sel_by = page.locator("select:visible").nth(0)
+    sel_op = page.locator("select:visible").nth(1)
+    val_in = page.locator("input[type='text']:visible").first
+
+    await sel_by.wait_for(state="visible", timeout=30000)
+    await sel_op.wait_for(state="visible", timeout=30000)
+    await val_in.wait_for(state="visible", timeout=30000)
+
+    # Choose by label if possible, otherwise by value guess
+    try:
+        await sel_by.select_option(label=re.compile(r"issued", re.I))
+    except Exception:
+        # fallback: pick option that contains ISSUED
+        await sel_by.select_option(
+            value=await sel_by.locator("option").filter(has_text=re.compile("issued", re.I)).first.get_attribute("value")
+        )
+
+    try:
+        await sel_op.select_option(label=re.compile(r"equals", re.I))
+    except Exception:
+        pass
+
+    await val_in.fill(issued)
+
+    # Click SEARCH button
+    search_btn = page.locator("button:visible, input[type='submit']:visible, input[type='button']:visible").filter(
+        has_text=re.compile(r"search", re.I)
+    ).first
+    if await search_btn.count() == 0:
+        search_btn = page.locator("button:visible, input[type='submit']:visible, input[type='button']:visible").first
+
+    await search_btn.click()
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1200)
+    await snap(page, "30_results_loaded")
+
+    return issued
+
+async def extract_rows(page):
+    # Look for a results table containing PERMIT_NO
+    # (Your screenshot shows columns PERMIT_NO, ISSUED, Permit Type, STATUS, SITE_APN, SITE_ADDR)
+    tbl = page.locator("table:visible").filter(has_text=re.compile(r"PERMIT_NO", re.I)).first
+    if await tbl.count() == 0:
+        # Telerik grids sometimes render headers outside <th>; still keep debug + hard fail
+        raise RuntimeError("Could not find a visible table containing PERMIT_NO on the results page.")
+
+    # Extract header cells
+    header_cells = tbl.locator("tr").first.locator("th, td")
+    headers = [re.sub(r"\s+", " ", (await header_cells.nth(i).inner_text()).strip())
+               for i in range(await header_cells.count())]
+
+    # Extract body rows (skip any header-like rows)
     rows = []
-    trs = table.locator("tr")
-    trn = await trs.count()
-    for i in range(1, trn):  # skip header row
-        tr = trs.nth(i)
+    tr_all = tbl.locator("tr")
+    for r in range(await tr_all.count()):
+        tr = tr_all.nth(r)
         tds = tr.locator("td")
         if await tds.count() == 0:
             continue
-        cells = [" ".join(c.split()) for c in await tds.all_inner_texts()]
-        # skip empty/junk rows
-        if not any(cells):
-            continue
-        rows.append(cells)
-    return rows
+        cells = [re.sub(r"\s+", " ", (await tds.nth(i).inner_text()).strip())
+                 for i in range(await tds.count())]
+        # Skip empty rows
+        if any(cells):
+            rows.append(cells)
 
-async def click_next_if_available(page):
-    # Common eTRAKiT pager patterns: "Next", ">", or "›"
-    candidates = [
-        page.locator("a").filter(has_text=re.compile(r"^\s*Next\s*$", re.I)),
-        page.locator("a").filter(has_text=re.compile(r"^\s*[>›]\s*$")),
-        page.locator("input[type=submit], button").filter(has_text=re.compile(r"Next|>", re.I)),
-    ]
+    # Save a small report for inspection
+    os.makedirs("data", exist_ok=True)
+    with open("data/40_table_report.json", "w", encoding="utf-8") as f:
+        json.dump({"headers": headers, "row_count": len(rows), "sample_rows": rows[:5]}, f, indent=2)
 
-    next_el = None
-    for loc in candidates:
-        if await loc.count() > 0:
-            next_el = loc.first
-            break
+    return headers, rows
 
-    if not next_el:
-        return False
+def debris_signal(desc: str):
+    d = (desc or "").upper()
+    hits = []
+    for k in ["DEMO", "DEMOL", "TEAR", "ROOF", "REMODEL", "RENOV", "ADDITION", "CONCRETE", "REMOVE"]:
+        if k in d:
+            hits.append(k)
+    if not hits:
+        return []
+    return [{"name": "debris_generation", "confidence": 0.7, "evidence": hits[:4]}]
 
-    # Try to detect disabled state
-    aria_disabled = (await next_el.get_attribute("aria-disabled")) or ""
-    cls = (await next_el.get_attribute("class")) or ""
-    if aria_disabled.lower() == "true" or "disabled" in cls.lower():
-        return False
+async def main():
+    os.makedirs("data", exist_ok=True)
 
-    try:
-        await next_el.click()
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(500)
-        return True
-    except Exception:
-        return False
-
-async def fetch_etrakit_rows(search_date: str):
-    user = os.environ.get("ETRAKIT_USER")
-    pw = os.environ.get("ETRAKIT_PASS")
+    user = os.environ.get("ETRAKIT_USER") or ""
+    pw = os.environ.get("ETRAKIT_PASS") or ""
     if not user or not pw:
-        raise RuntimeError("Missing ETRAKIT_USER / ETRAKIT_PASS env vars (set GitHub Secrets).")
+        raise RuntimeError("Missing secrets: set ETRAKIT_USER and ETRAKIT_PASS in workflow env.")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
         await login(page, user, pw)
-        await page.goto(SEARCH_URL, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle")
-        await snap(page, "00_search_page")
-        await dump_html(page, "00_search_page")
+        issued_date = await run_search(page)
+        headers, rows = await extract_rows(page)
 
-        # Locate the "Search By" select near the label (avoid sidebar selects)
-        search_by = page.locator("xpath=//*[contains(normalize-space(.),'Search By')]/following::select[1]")
-        op_sel   = page.locator("xpath=//*[contains(normalize-space(.),'Search Operator')]/following::select[1]")
-        val_in   = page.locator("xpath=//*[contains(normalize-space(.),'Search Value')]/following::input[1]")
+        # Map columns by header name (robust to column order changes)
+        def col_idx(name):
+            for i, h in enumerate(headers):
+                if name.upper() in h.upper():
+                    return i
+            return None
 
-        if await search_by.count() == 0 or await op_sel.count() == 0 or await val_in.count() == 0:
-            await snap(page, "01_missing_controls")
-            await dump_html(page, "01_missing_controls")
-            raise RuntimeError("Could not locate Search By / Operator / Value controls on eTRAKiT page.")
+        i_permit = col_idx("PERMIT_NO")
+        i_issued = col_idx("ISSUED")
+        i_type   = col_idx("Permit Type")
+        i_apn    = col_idx("SITE_APN")
+        i_addr   = col_idx("SITE_ADDR")
 
-        # Select ISSUED and Equals; then type date
-        # (Your dropdown options showed: permit_NO, permit type, issued, status, site_addr, site_apn)
-        await search_by.first.select_option(label=re.compile(r"issued", re.I))
-        await op_sel.first.select_option(label=re.compile(r"equals", re.I))
-        await val_in.first.fill(search_date)
+        out = []
+        for cells in rows:
+            permit_no = cells[i_permit] if i_permit is not None and i_permit < len(cells) else ""
+            issued = cells[i_issued] if i_issued is not None and i_issued < len(cells) else issued_date
+            ptype = cells[i_type] if i_type is not None and i_type < len(cells) else ""
+            addr = cells[i_addr] if i_addr is not None and i_addr < len(cells) else ""
+            apn = cells[i_apn] if i_apn is not None and i_apn < len(cells) else ""
 
-        # Click SEARCH
-        btn = page.locator("button, input[type=submit], input[type=button]").filter(has_text=re.compile(r"^\s*SEARCH\s*$", re.I)).first
-        if await btn.count() == 0:
-            # fallback by value attribute
-            btn = page.locator("input").filter(has_text=re.compile("search", re.I)).first
+            desc = ptype  # for now, we’ll enrich later by clicking into permit detail pages
 
-        await btn.click()
-        await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(700)
-        await snap(page, "10_results_page")
-        await dump_html(page, "10_results_page")
+            rec = {
+                "source": "etrakit",
+                "jurisdiction": "Greenville County",
+                "issued_date": issued,
+                "project": {
+                    "address": addr,
+                    "description": desc,
+                    "permit_type": ptype,
+                    "value": None,
+                    "site_apn": apn
+                },
+                "contractor": {"name": None, "phone": None, "license": None},
+                "owner": {"name": None, "address": None},
+                "signals": debris_signal(desc),
+                "fingerprint": fp(issued or "", permit_no or "", addr or "", desc or ""),
+                "source_url": SEARCH_URL,
+                "scraped_at": now_iso(),
+                "confidence": 0.75
+            }
+            out.append(rec)
 
-        table, hdr = await find_results_table(page)
-        if not table:
-            await snap(page, "11_no_results_table")
-            await dump_html(page, "11_no_results_table")
-            raise RuntimeError("Could not find results table with PERMIT_NO + ISSUED headers on results page.")
+        run_date = datetime.now(timezone.utc).date().isoformat()
+        path = f"data/{run_date}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, ensure_ascii=False)
 
-        all_rows = []
-        max_pages = 10  # safety cap
-        for _ in range(max_pages):
-            rows = await parse_current_page_rows(table)
-            all_rows.extend(rows)
-
-            moved = await click_next_if_available(page)
-            if not moved:
-                break
-
-            # refresh table handle after navigation
-            table, hdr = await find_results_table(page)
-            if not table:
-                break
-
+        print(f"Wrote {len(out)} records -> {path}")
         await browser.close()
-        return hdr, all_rows
-
-async def main():
-    run_date = datetime.now(timezone.utc).date().isoformat()
-    os.makedirs("data", exist_ok=True)
-
-    search_date = local_yesterday_mmddyyyy()
-    hdr, rows = await fetch_etrakit_rows(search_date)
-
-    # Map columns by header text (so we don’t guess indices)
-    hdr_u = [h.upper().strip() for h in hdr]
-    def idx(name):
-        name = name.upper()
-        for i, h in enumerate(hdr_u):
-            if h == name or h.replace(" ", "_") == name:
-                return i
-        return None
-
-    i_permit = idx("PERMIT_NO") or idx("PERMIT NO")
-    i_issued = idx("ISSUED")
-    i_type   = idx("PERMIT TYPE")
-    i_status = idx("STATUS")
-    i_apn    = idx("SITE_APN")
-    i_addr   = idx("SITE_ADDR")
-
-    out = []
-    for cells in rows:
-        permit_no = cells[i_permit] if i_permit is not None and i_permit < len(cells) else None
-        issued    = cells[i_issued] if i_issued is not None and i_issued < len(cells) else search_date
-        ptype     = cells[i_type]   if i_type   is not None and i_type   < len(cells) else None
-        status    = cells[i_status] if i_status is not None and i_status < len(cells) else None
-        apn       = cells[i_apn]    if i_apn    is not None and i_apn    < len(cells) else None
-        addr      = cells[i_addr]   if i_addr   is not None and i_addr   < len(cells) else None
-
-        desc = " | ".join([c for c in [ptype, status] if c])
-
-        rec = {
-            "source": "etrakit",
-            "jurisdiction": "Greenville County",
-            "issued_date": issued,
-            "project": {
-                "permit_no": permit_no,
-                "address": addr,
-                "apn": apn,
-                "permit_type": ptype,
-                "status": status,
-                "description": desc,
-                "value": None
-            },
-            "contractor": {"name": None, "phone": None, "license": None},
-            "owner": {"name": None, "address": None},
-            "signals": debris_signal(ptype or ""),
-            "fingerprint": fp(issued or "", permit_no or "", addr or "", desc or ""),
-            "source_url": SEARCH_URL,
-            "scraped_at": now_iso(),
-            "confidence": 0.75
-        }
-        out.append(rec)
-
-    path = f"data/{run_date}.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
-
-    print(f"Searched ISSUED={search_date}")
-    print(f"Headers: {hdr}")
-    print(f"Wrote {len(out)} records -> {path}")
 
 if __name__ == "__main__":
     asyncio.run(main())
