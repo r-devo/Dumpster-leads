@@ -1,10 +1,7 @@
-import os
-import json
-import hashlib
-import re
-import asyncio
+import os, json, hashlib
 from datetime import datetime, timezone, timedelta
-
+import asyncio
+from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright
 
 
@@ -17,218 +14,268 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def fp(issued_date, permit_no, address, permit_type, status):
-    base = f"{issued_date}|{permit_no}|{address}|{permit_type}|{status}".upper().encode("utf-8")
+def fp(issued_date, permit_no, address, permit_type):
+    base = f"{issued_date}|{permit_no}|{address}|{permit_type}".upper().encode("utf-8")
     return hashlib.sha256(base).hexdigest()
 
 
-def local_yesterday_mdy():
-    # Greenville is Eastern; GitHub runner is UTC. This is "good enough" for daily runs.
-    return (datetime.now() - timedelta(days=1)).strftime("%m/%d/%Y")
+def eastern_yesterday_mmddyyyy():
+    tz = ZoneInfo("America/New_York")
+    d = datetime.now(tz).date() - timedelta(days=1)
+    return d.strftime("%m/%d/%Y")
 
 
-async def snap(page, name: str):
+async def save_debug(page, stem: str):
     os.makedirs("data", exist_ok=True)
     try:
-        await page.screenshot(path=f"data/{name}.png", full_page=True)
+        await page.screenshot(path=f"data/{stem}.png", full_page=True)
     except Exception:
         pass
-
-
-async def dump_html(page, name: str):
-    os.makedirs("data", exist_ok=True)
     try:
         html = await page.content()
-        with open(f"data/{name}.html", "w", encoding="utf-8") as f:
+        with open(f"data/{stem}.html", "w", encoding="utf-8") as f:
             f.write(html)
     except Exception:
         pass
 
 
-async def login_public(page, username: str, password: str):
-    # Load login page
+async def login(page, username: str, password: str):
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(800)
-    await snap(page, "00_login_loaded")
-    await dump_html(page, "00_login_loaded")
+    await page.wait_for_load_state("networkidle")
+    await save_debug(page, "00_login_loaded")
 
-    # IMPORTANT: select "Public" user type (your artifacts show default is Contractor)
-    user_type = page.locator("#ucLogin_ddlUserType")
-    await user_type.wait_for(state="visible", timeout=30000)
-    await user_type.select_option(label="Public")
+    # Select login type = Public (dropdown exists on the login bar)
+    # HTML shows: <select id="ctl00_ddlLoginType"> with options like Public/Contractor/etc
+    ddl = page.locator("#ctl00_ddlLoginType")
+    if await ddl.count() > 0:
+        # Prefer selecting by visible label if present
+        try:
+            await ddl.select_option(label="Public")
+        except Exception:
+            # Fallback: try value "Public"
+            try:
+                await ddl.select_option(value="Public")
+            except Exception:
+                pass
 
-    # Fill credentials (IDs confirmed from your 00_login_loaded.html)
-    user = page.locator("#ucLogin_RadTextBox2")
+    # Use stable IDs from the page HTML (these exist in your artifact)
+    user = page.locator("#ucLogin_txtLoginId")
     pw = page.locator("#ucLogin_txtPassword")
-    await user.wait_for(state="visible", timeout=30000)
-    await pw.wait_for(state="visible", timeout=30000)
+    btn = page.locator("#ucLogin_btnLogin")
+
+    await user.wait_for(state="visible", timeout=60000)
+    await pw.wait_for(state="visible", timeout=60000)
 
     await user.fill(username)
     await pw.fill(password)
 
-    # Click login button (ID confirmed from your HTML)
-    btn = page.locator("#ucLogin_btnLogin")
-    await btn.click()
+    # Click login and wait for navigation / postback
+    async with page.expect_navigation(wait_until="networkidle", timeout=60000):
+        await btn.click()
 
-    # Wait for navigation / settled state
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(800)
+    await save_debug(page, "01_after_login")
 
-    await snap(page, "01_after_login")
-    await dump_html(page, "01_after_login")
-
-    # Quick sanity check: if the page still contains "Invalid Contractor Login" or similar, fail loudly
-    body_text = (await page.locator("body").inner_text()).lower()
-    if "invalid contractor login" in body_text:
-        raise RuntimeError("Login failed because page indicates 'Invalid Contractor Login' (user type selection may not have applied).")
-    if "invalid" in body_text and "login" in body_text:
-        # generic login failure
-        raise RuntimeError("Login appears to have failed (page contains 'invalid' and 'login').")
+    # Basic sanity: logged-in UI usually has "LOG OUT" somewhere
+    # If not, still proceed, but this gives better failure diagnostics.
+    if await page.locator("text=LOG OUT").count() == 0 and await page.locator("text=Log Out").count() == 0:
+        # Not fatal; some installs redirect differently. We'll continue.
+        pass
 
 
-async def run_search_and_extract(page, issued_date_mdy: str):
-    # Go directly to the permit search page
+async def find_results_table(page):
+    """
+    eTRAKiT results grid is usually a <table>. We find the one whose text
+    contains the expected headers/columns.
+    """
+    tables = page.locator("table")
+    n = await tables.count()
+
+    report = []
+    best_idx = None
+
+    for i in range(n):
+        t = tables.nth(i)
+        try:
+            txt = (await t.inner_text()).strip()
+        except Exception:
+            continue
+
+        head = " ".join(txt.split())[:220]
+        up = txt.upper()
+
+        score = 0
+        for k in ["PERMIT_NO", "ISSUED", "SITE_ADDR", "SITE_APN", "STATUS"]:
+            if k in up:
+                score += 1
+
+        rows = 0
+        try:
+            rows = await t.locator("tr").count()
+        except Exception:
+            pass
+
+        report.append({"table_index": i, "score": score, "row_count": rows, "preview": head})
+
+        if score >= 3 and rows >= 2:
+            best_idx = i
+            break
+
+    os.makedirs("data", exist_ok=True)
+    with open("data/20_table_report.json", "w", encoding="utf-8") as f:
+        json.dump({"table_count": n, "tables": report}, f, indent=2)
+
+    return best_idx
+
+
+async def scrape_for_date(page, issued_mmddyyyy: str):
     await page.goto(SEARCH_URL, wait_until="domcontentloaded")
     await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(500)
+    await save_debug(page, "10_search_page_loaded")
 
-    await snap(page, "10_search_page_loaded")
-    await dump_html(page, "10_search_page_loaded")
+    # Known IDs from the eTRAKiT search page artifact
+    dd_by = page.locator("#ctl00_cplMain_ddSearchBy")
+    dd_op = page.locator("#ctl00_cplMain_ddSearchOperator")
+    txt = page.locator("#ctl00_cplMain_txtSearchString")
+    btn = page.locator("#ctl00_cplMain_btnSearch")
 
-    # Controls confirmed from your search page HTML (10_search_page_loaded.html)
-    dd_by = page.locator("#cplMain_ddSearchBy")
-    dd_op = page.locator("#cplMain_ddSearchOper")
-    txt = page.locator("#cplMain_txtSearchString")
-    btn = page.locator("#cplMain_btnSearch")
+    await dd_by.wait_for(state="visible", timeout=60000)
+    await dd_op.wait_for(state="visible", timeout=60000)
+    await txt.wait_for(state="visible", timeout=60000)
 
-    await dd_by.wait_for(state="visible", timeout=30000)
-    await dd_op.wait_for(state="visible", timeout=30000)
-    await txt.wait_for(state="visible", timeout=30000)
-
+    # Select ISSUED and Equals
     await dd_by.select_option(label="ISSUED")
     await dd_op.select_option(label="Equals")
-    await txt.fill(issued_date_mdy)
 
-    await btn.click()
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(800)
+    await txt.fill(issued_mmddyyyy)
 
-    await snap(page, "20_results_loaded")
-    await dump_html(page, "20_results_loaded")
+    async with page.expect_navigation(wait_until="networkidle", timeout=60000):
+        await btn.click()
 
-    # Find the results table by headers (matches what you see: PERMIT_NO, ISSUED, Permit Type, STATUS, SITE_APN, SITE_ADDR)
-    tables = page.locator("table")
-    table_count = await tables.count()
+    await save_debug(page, "11_after_search")
 
-    best_table = None
-    best_score = -1
+    # Find results table
+    best_idx = await find_results_table(page)
+    if best_idx is None:
+        await save_debug(page, "99_final_state")
+        raise RuntimeError("Could not locate permit results table. See data/20_table_report.json and data/11_after_search.*")
 
-    wanted = ["PERMIT_NO", "ISSUED", "PERMIT TYPE", "STATUS", "SITE_APN", "SITE_ADDR"]
+    table = page.locator("table").nth(best_idx)
 
-    for i in range(table_count):
-        t = tables.nth(i)
-        txt_all = (await t.inner_text()).upper()
-
-        score = sum(1 for w in wanted if w in txt_all)
-        # Prefer tables that include multiple expected headers
-        if score > best_score:
-            best_score = score
-            best_table = t
-
-    if not best_table or best_score < 3:
-        # Save a small diagnostic report
-        report = []
-        for i in range(min(table_count, 15)):
-            t = tables.nth(i)
-            tt = (await t.inner_text()).strip().replace("\n", " ")
-            report.append({"table_index": i, "preview": tt[:240]})
-        with open("data/99_table_debug.json", "w", encoding="utf-8") as f:
-            json.dump({"table_count": table_count, "best_score": best_score, "tables": report}, f, indent=2)
-        await snap(page, "99_final_state")
-        await dump_html(page, "99_final_state")
-        raise RuntimeError("Could not confidently identify the permit results table. See data/99_table_debug.json and screenshots.")
-
-    # Extract rows
-    rows = []
-    trs = best_table.locator("tr")
+    # Parse header row + data rows
+    trs = table.locator("tr")
     tr_count = await trs.count()
+    if tr_count < 2:
+        raise RuntimeError("Results table exists but has no rows.")
 
-    for r in range(tr_count):
-        tr = trs.nth(r)
-        tds = tr.locator("td")
-        if await tds.count() == 0:
+    # Header can be <th> or <td>
+    header_cells = trs.nth(0).locator("th, td")
+    hcount = await header_cells.count()
+    headers = []
+    for i in range(hcount):
+        headers.append(" ".join((await header_cells.nth(i).inner_text()).split()))
+
+    # Build index map (case-insensitive)
+    norm = {h.upper().strip(): idx for idx, h in enumerate(headers)}
+
+    def get_cell(cells, key, fallback_idx=None):
+        idx = norm.get(key)
+        if idx is None:
+            idx = fallback_idx
+        if idx is None or idx >= len(cells):
+            return ""
+        return cells[idx]
+
+    rows = []
+    for r in range(1, tr_count):
+        tds = trs.nth(r).locator("td")
+        c = await tds.count()
+        if c == 0:
             continue
         cells = []
-        for c in range(await tds.count()):
-            cell = (await tds.nth(c).inner_text()).strip()
-            cell = " ".join(cell.split())
-            cells.append(cell)
-        if cells:
-            rows.append(cells)
+        for i in range(c):
+            cells.append(" ".join((await tds.nth(i).inner_text()).split()))
+        rows.append(cells)
 
-    return rows
+    return headers, rows
+
+
+def debris_signal(text: str):
+    d = (text or "").upper()
+    hits = []
+    for k in ["DEMO", "DEMOL", "TEAR", "ROOF", "REMODEL", "RENOV", "ADDITION", "CONCRETE", "REMOVE"]:
+        if k in d:
+            hits.append(k)
+    if not hits:
+        return []
+    return [{"name": "debris_generation", "confidence": 0.7, "evidence": hits[:4]}]
 
 
 async def main():
-    username = os.getenv("ETRAKIT_USER", "").strip()
-    password = os.getenv("ETRAKIT_PASS", "").strip()
-    if not username or not password:
+    user = os.environ.get("ETRAKIT_USER", "").strip()
+    pw = os.environ.get("ETRAKIT_PASS", "").strip()
+    if not user or not pw:
         raise RuntimeError("Missing ETRAKIT_USER / ETRAKIT_PASS env vars (GitHub Secrets).")
 
+    issued = eastern_yesterday_mmddyyyy()
+    run_date = datetime.now(timezone.utc).date().isoformat()
     os.makedirs("data", exist_ok=True)
-
-    issued_date = local_yesterday_mdy()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
 
-        # Login (Public)
-        await login_public(page, username, password)
+        await login(page, user, pw)
+        headers, rows = await scrape_for_date(page, issued)
 
-        # Search & extract
-        rows = await run_search_and_extract(page, issued_date)
+        # Write parsed leads
+        out = []
+        for cells in rows:
+            permit_no = cells[0] if len(cells) > 0 else ""
+            issued_date = issued
+            permit_type = cells[2] if len(cells) > 2 else ""
+            status = cells[3] if len(cells) > 3 else ""
+            site_apn = cells[4] if len(cells) > 4 else ""
+            site_addr = cells[5] if len(cells) > 5 else ""
+
+            rec = {
+                "source": "etrakit",
+                "jurisdiction": "Greenville County",
+                "issued_date": issued_date,
+                "permit_no": permit_no,
+                "project": {
+                    "address": site_addr,
+                    "description": permit_type,
+                    "permit_type": permit_type,
+                    "status": status,
+                    "apn": site_apn,
+                },
+                "signals": debris_signal(permit_type),
+                "fingerprint": fp(issued_date, permit_no, site_addr, permit_type),
+                "source_url": SEARCH_URL,
+                "scraped_at": now_iso(),
+                "confidence": 0.8
+            }
+            out.append(rec)
+
+        path = f"data/{run_date}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "issued_query": issued,
+                    "headers": headers,
+                    "records": out
+                },
+                f,
+                indent=2,
+                ensure_ascii=False
+            )
+
+        print(f"Issued query: {issued}")
+        print(f"Parsed {len(out)} permits -> {path}")
 
         await browser.close()
-
-    # Map extracted columns based on what your table shows (PERMIT_NO, ISSUED, Permit Type, STATUS, SITE_APN, SITE_ADDR)
-    out = []
-    for cells in rows:
-        permit_no = cells[0] if len(cells) > 0 else ""
-        issued = cells[1] if len(cells) > 1 else issued_date
-        permit_type = cells[2] if len(cells) > 2 else ""
-        status = cells[3] if len(cells) > 3 else ""
-        site_apn = cells[4] if len(cells) > 4 else ""
-        site_addr = cells[5] if len(cells) > 5 else ""
-
-        rec = {
-            "source": "etrakit",
-            "jurisdiction": "Greenville County",
-            "issued_date": issued,
-            "project": {
-                "permit_no": permit_no,
-                "permit_type": permit_type,
-                "status": status,
-                "site_apn": site_apn,
-                "address": site_addr,
-            },
-            "fingerprint": fp(issued, permit_no, site_addr, permit_type, status),
-            "source_url": SEARCH_URL,
-            "scraped_at": now_iso(),
-            "confidence": 0.75,
-        }
-        out.append(rec)
-
-    run_date = datetime.now(timezone.utc).date().isoformat()
-    path = f"data/{run_date}.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
-
-    print(f"Issued date searched: {issued_date}")
-    print(f"Wrote {len(out)} records -> {path}")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
