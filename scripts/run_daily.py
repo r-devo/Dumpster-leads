@@ -1,15 +1,15 @@
-import os, json, hashlib, random, re, asyncio
+import os, json, hashlib, random, asyncio
 from datetime import datetime, timezone, timedelta
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 BASE = "https://grvlc-trk.aspgov.com"
-HOME_URL = f"{BASE}/eTRAKiT/"
+LOGIN_URL = f"{BASE}/eTRAKiT/login.aspx?lt=either&rd=~/Search/permit.aspx"
 SEARCH_URL = f"{BASE}/eTRAKiT/Search/permit.aspx"
 OUT_DIR = "data"
 
-# ---- hard caps (prevents “retrying fill action” loops) ----
-STEP_TIMEOUT_MS = 12_000          # each step must succeed quickly or fail
-NAV_TIMEOUT_MS  = 20_000
+# Fail-fast caps (prevents “retrying fill action” loops)
+STEP_TIMEOUT_MS = 12_000
+NAV_TIMEOUT_MS = 20_000
 ACTION_TIMEOUT_MS = 6_000
 
 def now_iso():
@@ -19,14 +19,14 @@ def run_date():
     return datetime.now(timezone.utc).date().isoformat()
 
 def yesterday_mmddyyyy():
-    # Greenville/Eastern “good enough” for daily delta; refine later if needed
+    # good enough for daily delta; refine to ET later
     return (datetime.now() - timedelta(days=1)).strftime("%m/%d/%Y")
 
 def fp(*parts: str):
     base = "|".join([(p or "") for p in parts]).upper().encode("utf-8", errors="ignore")
     return hashlib.sha256(base).hexdigest()
 
-async def jitter(page, a=400, b=1200):
+async def jitter(page, a=350, b=950):
     await page.wait_for_timeout(random.randint(a, b))
 
 async def dump(page, stem: str):
@@ -41,84 +41,128 @@ async def dump(page, stem: str):
     except Exception:
         pass
 
-async def first_visible(page, selectors):
-    for sel in selectors:
-        loc = page.locator(sel)
-        try:
-            if await loc.count() and await loc.first.is_visible():
-                return loc.first
-        except Exception:
-            continue
-    return None
-
-async def must_visible(page, selectors, name):
-    el = await first_visible(page, selectors)
-    if not el:
+async def must_visible(page, selector: str, name: str):
+    loc = page.locator(selector)
+    try:
+        await loc.first.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+    except Exception:
         await dump(page, f"FAIL_missing_{name}")
-        raise RuntimeError(f"Missing/hidden required element: {name} ({selectors})")
-    return el
+        raise RuntimeError(f"Missing/hidden element: {name} ({selector})")
+    return loc.first
 
-async def login_public(page, user: str, pw: str):
-    await page.goto(HOME_URL, wait_until="domcontentloaded")
+async def select_public_login_type(page):
+    """Robustly select the 'Public' login type without assuming exact label/value."""
+    ddl = await must_visible(page, "select[name='ucLogin$ddlSelLogin']", "login_type_dropdown")
+
+    # Inspect options
+    opts = ddl.locator("option")
+    n = await opts.count()
+    if n == 0:
+        await dump(page, "FAIL_no_login_type_options")
+        raise RuntimeError("Login type dropdown has no options.")
+
+    public_value = None
+    public_label = None
+    for i in range(n):
+        opt = opts.nth(i)
+        label = ((await opt.inner_text()) or "").strip()
+        value = ((await opt.get_attribute("value")) or "").strip()
+        key = (label or value).lower()
+        # Match anything that looks like Public user
+        if "public" in key:
+            public_value = value if value else None
+            public_label = label if label else None
+            break
+
+    if not (public_value or public_label):
+        # Dump options for inspection (so we never guess again)
+        option_dump = []
+        for i in range(n):
+            opt = opts.nth(i)
+            option_dump.append({
+                "label": ((await opt.inner_text()) or "").strip(),
+                "value": ((await opt.get_attribute("value")) or "").strip()
+            })
+        with open(f"{OUT_DIR}/FAIL_login_type_options.json", "w", encoding="utf-8") as f:
+            json.dump(option_dump, f, indent=2)
+        await dump(page, "FAIL_no_public_option")
+        raise RuntimeError("Could not find a Public option in login type dropdown.")
+
+    # Select by value if possible (more stable), else label
+    if public_value:
+        await ddl.select_option(value=public_value)
+    else:
+        await ddl.select_option(label=public_label)
+
+    # Many WebForms pages require a postback for the selection to apply
+    await jitter(page, 500, 1100)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except PWTimeout:
+        pass
+    await dump(page, "01_after_public_selected")
+
+async def login_uc(page, username: str, password: str):
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
     await jitter(page)
-    await dump(page, "00_home_loaded")
+    await dump(page, "00_login_loaded")
 
-    # IMPORTANT: target the PUBLIC login fields (not Telerik hidden ones)
-    user_el = await must_visible(page,
-        ["#cplMain_txtPublicUserName", "input[id$='txtPublicUserName']"],
-        "public_username"
-    )
-    pass_el = await must_visible(page,
-        ["#cplMain_txtPublicPassword", "input[id$='txtPublicPassword']"],
-        "public_password"
-    )
-    btn_el = await must_visible(page,
-        ["#cplMain_btnPublicLogin", "input[id$='btnPublicLogin']", "button:has-text('Login')"],
-        "public_login_button"
-    )
+    await select_public_login_type(page)
 
-    await user_el.fill(user, timeout=ACTION_TIMEOUT_MS)
-    await pass_el.fill(pw, timeout=ACTION_TIMEOUT_MS)
-    await jitter(page, 300, 700)
+    # Wait until BOTH username + password are actually visible and enabled
+    user_in = await must_visible(page, "input#ucLogin_txtLoginId", "uc_username")
+    pass_in = await must_visible(page, "input#ucLogin_txtPassword", "uc_password")
 
-    # click + allow postback/navigation
+    # Extra: ensure not disabled
+    if (await pass_in.is_disabled()) or (await user_in.is_disabled()):
+        await dump(page, "FAIL_login_inputs_disabled")
+        raise RuntimeError("Login inputs are disabled after selecting Public (unexpected).")
+
+    btn = await must_visible(page, "input#ucLogin_btnLogin, button#ucLogin_btnLogin", "uc_login_button")
+
+    await user_in.fill(username, timeout=ACTION_TIMEOUT_MS)
+    await pass_in.fill(password, timeout=ACTION_TIMEOUT_MS)
+    await jitter(page, 250, 650)
+
+    # Click login; sometimes no navigation occurs
     try:
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS):
-            await btn_el.click(timeout=ACTION_TIMEOUT_MS)
+            await btn.click(timeout=ACTION_TIMEOUT_MS)
     except PWTimeout:
-        # some installs don’t “navigate”; they update in-place. Continue.
+        await btn.click(timeout=ACTION_TIMEOUT_MS)
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except PWTimeout:
         pass
 
-    await jitter(page, 600, 1400)
-    await dump(page, "01_after_login_attempt")
+    await jitter(page)
+    await dump(page, "02_after_login_click")
 
-    # verify login “sticks” by going to search page
+    # Validate login by loading search page and confirming controls exist
     await page.goto(SEARCH_URL, wait_until="domcontentloaded")
     await jitter(page)
     await dump(page, "10_search_loaded")
 
-    # If bounced back to login/home, we’ll be missing the search controls.
-    # We detect that by checking the Search-By dropdown existence.
-    dd = await first_visible(page, ["select#cplMain_ddSearchBy", "select#ctl00_cplMain_ddSearchBy"])
-    if not dd:
-        await dump(page, "FAIL_not_logged_in_or_no_search_controls")
-        raise RuntimeError("Login did not persist OR search controls not present (see FAIL_not_logged_in_or_no_search_controls.*).")
+    dd = page.locator("select#cplMain_ddSearchBy, select#ctl00_cplMain_ddSearchBy")
+    if await dd.count() == 0:
+        await dump(page, "FAIL_login_not_persisted")
+        raise RuntimeError("Login did not persist (search controls missing).")
 
 async def run_search(page, issued_date: str):
-    # Find search controls (IDs vary slightly)
-    dd_by = await must_visible(page, ["select#cplMain_ddSearchBy", "select#ctl00_cplMain_ddSearchBy"], "search_by")
-    dd_op = await must_visible(page, ["select#cplMain_ddSearchOper", "select#ctl00_cplMain_ddSearchOperator"], "search_operator")
-    txt   = await must_visible(page, ["#cplMain_txtSearchString", "#ctl00_cplMain_txtSearchString", "input[type='text']"], "search_value")
+    dd_by = await must_visible(page, "select#cplMain_ddSearchBy, select#ctl00_cplMain_ddSearchBy", "search_by")
+    dd_op = await must_visible(page, "select#cplMain_ddSearchOper, select#ctl00_cplMain_ddSearchOperator", "search_operator")
+    txt   = await must_visible(page, "#cplMain_txtSearchString, #ctl00_cplMain_txtSearchString", "search_value")
 
-    # set dropdowns by label (more stable than value)
     await dd_by.select_option(label="ISSUED")
     await dd_op.select_option(label="Equals")
     await txt.fill(issued_date, timeout=ACTION_TIMEOUT_MS)
 
     await dump(page, "11_search_filled")
 
-    btn = await must_visible(page,
-        ["#cplMain_btnSearch", "#ctl00_cplMain_btnSearch", "input[value='Search']", "button:has-text('Search')"],
+    btn = await must_visible(
+        page,
+        "#cplMain_btnSearch, #ctl00_cplMain_btnSearch, input[value='Search'], button:has-text('Search')",
         "search_button"
     )
 
@@ -126,23 +170,22 @@ async def run_search(page, issued_date: str):
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS):
             await btn.click(timeout=ACTION_TIMEOUT_MS)
     except PWTimeout:
+        await btn.click(timeout=ACTION_TIMEOUT_MS)
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except PWTimeout:
         pass
 
-    await jitter(page, 900, 1800)
+    await jitter(page, 900, 1700)
     await dump(page, "20_results_loaded")
 
 async def find_results_table(page):
-    # Prefer Telerik grid IDs if present
-    grid = await first_visible(page, ["table[id*='rgSearchRslts']", "table[id*='rgResults']", "table"])
-    if not grid:
-        return None
-
-    # Score all tables by whether they contain header tokens
     tables = page.locator("table")
     best = None
     best_score = -1
-
     wanted = ["PERMIT_NO", "ISSUED", "SITE_ADDR", "STATUS"]
+
     for i in range(await tables.count()):
         t = tables.nth(i)
         try:
@@ -159,14 +202,11 @@ async def find_results_table(page):
     return best
 
 async def parse_table(table):
-    # Extract header + rows
     headers = []
     ths = table.locator("th")
     if await ths.count():
         for i in range(await ths.count()):
-            h = " ".join((await ths.nth(i).inner_text()).split())
-            headers.append(h)
-
+            headers.append(" ".join((await ths.nth(i).inner_text()).split()))
     rows = []
     trs = table.locator("tr")
     for r in range(await trs.count()):
@@ -194,30 +234,28 @@ async def main():
         ctx = await browser.new_context()
         page = await ctx.new_page()
 
-        # Hard caps at the page level
         page.set_default_timeout(STEP_TIMEOUT_MS)
         page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
 
         try:
-            await login_public(page, user, pw)
+            await login_uc(page, user, pw)
             await run_search(page, issued)
 
             table = await find_results_table(page)
             if not table:
                 await dump(page, "FAIL_no_results_table")
-                raise RuntimeError("Permit results table not found (see FAIL_no_results_table.* and 20_results_loaded.*).")
+                raise RuntimeError("Results table not found. See FAIL_no_results_table.* and 20_results_loaded.*")
 
             headers, rows = await parse_table(table)
 
-            # naive column mapping (matches your visible table order)
             out = []
             for cells in rows:
-                permit_no = cells[0] if len(cells) > 0 else ""
-                issued_dt = cells[1] if len(cells) > 1 else issued
+                permit_no   = cells[0] if len(cells) > 0 else ""
+                issued_dt   = cells[1] if len(cells) > 1 else issued
                 permit_type = cells[2] if len(cells) > 2 else ""
-                status = cells[3] if len(cells) > 3 else ""
-                site_apn = cells[4] if len(cells) > 4 else ""
-                site_addr = cells[5] if len(cells) > 5 else ""
+                status      = cells[3] if len(cells) > 3 else ""
+                site_apn    = cells[4] if len(cells) > 4 else ""
+                site_addr   = cells[5] if len(cells) > 5 else ""
 
                 out.append({
                     "source": "etrakit",
@@ -230,12 +268,12 @@ async def main():
                         "site_apn": site_apn,
                         "address": site_addr,
                         "description": permit_type,
-                        "value": None
+                        "value": None,
                     },
                     "fingerprint": fp(issued_dt, permit_no, site_addr, permit_type, status),
                     "source_url": SEARCH_URL,
                     "scraped_at": now_iso(),
-                    "confidence": 0.75
+                    "confidence": 0.75,
                 })
 
             path = f"{OUT_DIR}/{run_date()}.json"
