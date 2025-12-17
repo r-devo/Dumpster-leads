@@ -1,28 +1,27 @@
-import os, json, hashlib, re
-from datetime import datetime, timedelta
+import os
+import re
+import json
 import asyncio
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from playwright.async_api import async_playwright
+
 
 BASE = "https://grvlc-trk.aspgov.com"
+
+# This is the login URL you showed (redirects to permit search after login)
 LOGIN_URL = f"{BASE}/eTRAKiT/login.aspx?lt=either&rd=~/Search/permit.aspx"
-SEARCH_URL = f"{BASE}/eTRAKiT/Search/permit.aspx"
+PERMIT_SEARCH_URL = f"{BASE}/eTRAKiT/Search/permit.aspx"
 
-def now_iso():
-    return datetime.utcnow().isoformat() + "Z"
 
-def mmddyyyy(d: datetime) -> str:
-    return d.strftime("%m/%d/%Y")
+def yesterday_mmddyyyy_tz(tz_name: str = "America/New_York") -> str:
+    now = datetime.now(ZoneInfo(tz_name))
+    y = now - timedelta(days=1)
+    return y.strftime("%m/%d/%Y")
 
-def local_yesterday_mmddyyyy():
-    # GitHub runners are UTC; Greenville is ET. This is "good enough" for daily pulls.
-    # If you want perfect ET, we can add zoneinfo later.
-    return mmddyyyy(datetime.now() - timedelta(days=1))
 
-def fp(issued_date, permit_no, address, permit_type, status):
-    base = f"{issued_date}|{permit_no}|{address}|{permit_type}|{status}".upper().encode("utf-8")
-    return hashlib.sha256(base).hexdigest()
-
-async def snap(page, name):
+async def snap(page, name: str):
     os.makedirs("data", exist_ok=True)
     try:
         await page.screenshot(path=f"data/{name}.png", full_page=True)
@@ -35,323 +34,231 @@ async def snap(page, name):
     except Exception:
         pass
 
-async def find_public_login_container(page):
-    """
-    We want the PUBLIC login form in the middle of the page, not the header.
-    Strategy: anchor on the big text 'LOG IN BELOW TO ENTER THE PUBLIC PORTAL'
-    then climb to a reasonable container.
-    """
-    anchor = page.locator("text=LOG IN BELOW TO ENTER THE PUBLIC PORTAL").first
-    if await anchor.count() == 0:
-        # fallback: "Public Login"
-        anchor = page.locator("text=Public Login").first
 
-    if await anchor.count() == 0:
-        return None
-
-    # climb up a few levels to find a div that contains inputs
-    for xpath in [
-        "xpath=ancestor::div[1]",
-        "xpath=ancestor::div[2]",
-        "xpath=ancestor::div[3]",
-        "xpath=ancestor::table[1]",
-        "xpath=ancestor::td[1]",
-    ]:
-        cand = anchor.locator(xpath)
-        if await cand.count() == 0:
-            continue
-        # does it contain visible inputs?
-        vis_inputs = cand.locator("input:visible")
-        if await vis_inputs.count() >= 2:
-            return cand
-    return None
-
-async def login(page, username: str, password: str):
+async def login_public_portal(page, username: str, password: str):
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(500)
     await snap(page, "00_login_loaded")
 
-    container = await find_public_login_container(page)
-    if container is None:
-        # last-resort: use page-wide visible inputs (still avoids hidden header inputs)
-        container = page
+    # IMPORTANT: Use the *Public Login box in the middle* (cplMain_* ids),
+    # not the header Telerik/Rad login fields.
+    user = page.locator("#cplMain_txtPublicUserName")
+    pw = page.locator("#cplMain_txtPublicPassword")
+    btn = page.locator("#cplMain_btnPublicLogin")
 
-    user_in = container.locator("input[type='text']:visible, input[type='email']:visible").first
-    pass_in = container.locator("input[type='password']:visible").first
+    await user.wait_for(state="visible", timeout=15000)
+    await pw.wait_for(state="visible", timeout=15000)
+    await btn.wait_for(state="visible", timeout=15000)
 
-    # Fill credentials
-    await user_in.click()
-    await user_in.fill(username)
-    await pass_in.click()
-    await pass_in.fill(password)
+    await user.fill(username)
+    await pw.fill(password)
 
-    # Click the visible LOGIN button in the same container
-    btn = container.locator("button:visible, input[type='submit']:visible, input[type='button']:visible").filter(
-        has_text=re.compile(r"^\s*login\s*$", re.I)
-    ).first
+    # Click login and wait for navigation / logged-in markers
+    async with page.expect_navigation(wait_until="domcontentloaded", timeout=20000):
+        await btn.click()
 
-    if await btn.count() == 0:
-        # fallback: any visible element that says LOGIN
-        btn = container.locator("text=LOGIN").first
-
-    await btn.click()
-
-    # Wait until we land on the search page (or at least show logged-in nav)
-    try:
-        await page.wait_for_url(re.compile(r".*/Search/permit\.aspx.*", re.I), timeout=20000)
-    except PWTimeout:
-        # Sometimes it stays same URL but logs in; attempt direct navigation:
-        await page.goto(SEARCH_URL, wait_until="domcontentloaded")
-
-    await page.wait_for_timeout(700)
+    await page.wait_for_timeout(800)
     await snap(page, "01_after_login")
 
-async def find_search_by_dropdown(page):
-    """
-    Find the 'Search By' dropdown by locating a <select> that has options including PERMIT_NO and ISSUED.
-    """
-    selects = page.locator("select:visible")
-    n = await selects.count()
-    for i in range(n):
-        sel = selects.nth(i)
-        try:
-            opts = await sel.locator("option").all_inner_texts()
-        except Exception:
-            continue
-        u = [o.strip().upper() for o in opts if o.strip()]
-        if "PERMIT_NO" in u and "ISSUED" in u:
-            return sel
-    return None
+    # Confirm we're actually logged in
+    # The permit search page shows "LOGGED IN AS: RIDGE DEVUONO" (from your screenshot).
+    # If this doesn't appear, treat as login failure.
+    logged_in_marker = page.locator("text=LOGGED IN AS").first
+    logout_marker = page.locator("text=LOG OUT").first
 
-async def select_option_case_insensitive(select_locator, desired_label_upper: str):
-    opts = await select_locator.locator("option").all_inner_texts()
-    for o in opts:
-        if o.strip().upper() == desired_label_upper:
-            await select_locator.select_option(label=o.strip())
-            return True
-    # sometimes the value is what we want
-    try:
-        await select_locator.select_option(value=desired_label_upper)
-        return True
-    except Exception:
-        return False
+    if await logged_in_marker.count() == 0 and await logout_marker.count() == 0:
+        # Sometimes it lands on a page that still requires redirect; try direct.
+        await page.goto(PERMIT_SEARCH_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(800)
 
-async def wait_for_results_grid(page):
-    """
-    Wait until the Telerik RadGrid for search results has at least one data row.
-    The container id usually ends with rgSearchRslts.
-    """
-    grid = page.locator("div[id$='rgSearchRslts'], div[id*='rgSearchRslts']").first
-    await grid.wait_for(state="visible", timeout=20000)
+    await snap(page, "02_after_login_or_redirect")
 
-    # Wait for a table row with TDs (data row)
-    data_row = grid.locator("table tr:has(td)").first
-    await data_row.wait_for(state="visible", timeout=30000)
-    return grid
+    if await logged_in_marker.count() == 0 and await logout_marker.count() == 0:
+        raise RuntimeError("Login did not appear successful (no LOGGED IN AS / LOG OUT found).")
 
-async def parse_grid_rows(grid):
-    """
-    Parse the first table under the grid container into rows (list of dicts).
-    """
-    table = grid.locator("table").first
-    # header
-    headers = await table.locator("tr").first.locator("th").all_inner_texts()
-    headers = [h.strip() for h in headers if h.strip()]
-    # data rows
-    rows = []
-    trs = table.locator("tr:has(td)")
-    trn = await trs.count()
-    for i in range(trn):
-        tds = await trs.nth(i).locator("td").all_inner_texts()
-        tds = [" ".join(t.split()) for t in tds]
-        if headers and len(tds) >= len(headers):
-            rec = {headers[j]: tds[j] for j in range(len(headers))}
-        else:
-            rec = {f"col_{j}": tds[j] for j in range(len(tds))}
-        rows.append(rec)
-    return headers, rows
 
-async def click_next_if_available(page, grid, first_row_sig: str):
-    """
-    Try to click a RadGrid pager 'Next' button.
-    Return True if we successfully advanced to a different page of results.
-    """
-    # Common Telerik next selectors
-    next_candidates = grid.locator(
-        "a.rgPageNext:visible, a[title*='Next']:visible, input[title*='Next']:visible, a:visible >> text=>"
-    )
-
-    # The last selector (text=>) is not Playwright syntax; keep it conservative:
-    # We'll check a.rgPageNext or title contains Next, plus an icon-like anchor.
-    candidates = [
-        grid.locator("a.rgPageNext:visible").first,
-        grid.locator("a[title*='Next']:visible").first,
-        grid.locator("input[title*='Next']:visible").first,
-    ]
-
-    btn = None
-    for c in candidates:
-        if await c.count() > 0:
-            btn = c
-            break
-
-    if btn is None:
-        return False
-
-    # Some next buttons are disabled; check attribute/class
-    cls = (await btn.get_attribute("class")) or ""
-    if "rgPageDisabled" in cls or "disabled" in cls.lower():
-        return False
-
-    await btn.click()
-
-    # Wait for the first data row to change (page advance)
-    try:
-        await page.wait_for_timeout(500)
-        await wait_for_results_grid(page)
-        # quick heuristic: content changed
-        new_grid = page.locator("div[id$='rgSearchRslts'], div[id*='rgSearchRslts']").first
-        _, rows = await parse_grid_rows(new_grid)
-        if not rows:
-            return False
-        new_sig = json.dumps(rows[0], sort_keys=True)
-        return new_sig != first_row_sig
-    except Exception:
-        return False
-
-async def run_search(page, issued_date_mmddyyyy: str):
-    await page.goto(SEARCH_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(600)
+async def run_permit_search(page, issued_date_mmddyyyy: str):
+    # Ensure we're on the permit search page
+    await page.goto(PERMIT_SEARCH_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(800)
     await snap(page, "10_search_page_loaded")
 
-    # 1) Set Search By dropdown to ISSUED
-    dd = await find_search_by_dropdown(page)
-    if dd is None:
-        await snap(page, "90_failed_no_dropdown")
-        raise RuntimeError("Could not locate Search By dropdown containing PERMIT_NO and ISSUED.")
+    # These IDs exist on the permit search HTML from your successful logged-in artifact:
+    # - Search By dropdown: cplMain_ddSearchBy
+    # - Operator dropdown: cplMain_ddSearchOper
+    # - Search string input: cplMain_txtSearchString
+    # - Search button: ctl00_cplMain_btnSearch
+    search_by = page.locator("#cplMain_ddSearchBy")
+    oper = page.locator("#cplMain_ddSearchOper")
+    val = page.locator("#cplMain_txtSearchString")
+    btn = page.locator("#ctl00_cplMain_btnSearch")
 
-    ok = await select_option_case_insensitive(dd, "ISSUED")
-    if not ok:
-        await snap(page, "90_failed_select_issued")
-        raise RuntimeError("Could not select ISSUED in Search By dropdown.")
+    await search_by.wait_for(state="visible", timeout=15000)
+    await oper.wait_for(state="visible", timeout=15000)
+    await val.wait_for(state="visible", timeout=15000)
+    await btn.wait_for(state="visible", timeout=15000)
 
-    # 2) Fill Search Value
-    # Try to find the input following the "Search Value" label, otherwise fallback to first visible text input inside main area.
-    value_in = page.locator(
-        "xpath=//*[contains(normalize-space(.),'Search Value')]/following::input[1]"
-    ).filter(has=page.locator(":visible")).first
+    # Select ISSUED in "Search By"
+    # Option values on the site are uppercase like ISSUED, PERMIT_NO, etc.
+    # We'll try by value first, then by label fallback.
+    try:
+        await search_by.select_option(value="ISSUED")
+    except Exception:
+        # Fallback: find any option whose label contains "issued"
+        options = await search_by.locator("option").all()
+        chosen = None
+        for opt in options:
+            t = (await opt.text_content()) or ""
+            v = (await opt.get_attribute("value")) or ""
+            if "issued" in t.lower() or v.upper() == "ISSUED":
+                chosen = v
+                break
+        if not chosen:
+            raise RuntimeError("Could not find ISSUED option in Search By dropdown.")
+        await search_by.select_option(value=chosen)
 
-    if await value_in.count() == 0:
-        # fallback: visible text input not in header (best effort)
-        value_in = page.locator("input[type='text']:visible").nth(0)
+    # Operator stays equals (but enforce it)
+    try:
+        await oper.select_option(value="EQUALS")
+    except Exception:
+        # Fallback by label
+        await oper.select_option(label="Equals")
 
-    await value_in.click()
-    await value_in.fill(issued_date_mmddyyyy)
+    # Fill date
+    await val.fill(issued_date_mmddyyyy)
 
-    # 3) Click SEARCH button (the actual submit)
-    # Prefer an element with exact text SEARCH.
-    btn = page.locator("button:visible, input[type='submit']:visible, input[type='button']:visible").filter(
-        has_text=re.compile(r"^\s*search\s*$", re.I)
-    ).first
-    if await btn.count() == 0:
-        # fallback: text node SEARCH
-        btn = page.locator("text=SEARCH").first
+    await snap(page, "11_before_search_click")
 
+    # Click search and wait until results area appears
     await btn.click()
+    await page.wait_for_timeout(1200)
+    await snap(page, "12_after_search_click")
 
-    # 4) Wait for results to populate
-    await page.wait_for_timeout(400)
-    await snap(page, "11_after_search_click")
-    grid = await wait_for_results_grid(page)
-    await snap(page, "12_results_page1")
+    # Wait for the results table headers you showed: PERMIT_NO / ISSUED / Permit Type / STATUS / SITE_APN / SITE_ADDR
+    # Sometimes header casing varies; check loosely.
+    await page.wait_for_timeout(800)
+    await snap(page, "13_post_wait")
 
-    headers, rows1 = await parse_grid_rows(grid)
-    sig1 = json.dumps(rows1[0], sort_keys=True) if rows1 else ""
+    # Try to locate a table that contains PERMIT_NO and ISSUED somewhere near the header row
+    tables = page.locator("table")
+    tcount = await tables.count()
 
-    rows_all = list(rows1)
+    def looks_like_header(txt: str) -> bool:
+        txt_u = txt.upper()
+        return ("PERMIT_NO" in txt_u) and ("ISSUED" in txt_u) and ("SITE_ADDR" in txt_u)
 
-    # 5) Try to click Next page once
-    advanced = await click_next_if_available(page, grid, sig1)
-    if advanced:
-        await page.wait_for_timeout(600)
-        await snap(page, "13_results_page2")
-        grid2 = page.locator("div[id$='rgSearchRslts'], div[id*='rgSearchRslts']").first
-        _, rows2 = await parse_grid_rows(grid2)
-        rows_all.extend(rows2)
+    found_table_index = None
+    for i in range(tcount):
+        txt = (await tables.nth(i).inner_text()) or ""
+        if looks_like_header(txt):
+            found_table_index = i
+            break
 
-    return headers, rows_all
+    if found_table_index is None:
+        # Dump a quick report for debugging
+        report = {"issued_date": issued_date_mmddyyyy, "table_count": tcount, "tables": []}
+        for i in range(min(tcount, 25)):
+            txt = (await tables.nth(i).inner_text()) or ""
+            preview = " ".join(txt.split())[:240]
+            report["tables"].append({"i": i, "preview": preview})
+        os.makedirs("data", exist_ok=True)
+        with open("data/20_table_report.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        raise RuntimeError("Results table not found after search. See data/12_after_search_click.png and data/20_table_report.json")
 
-def debris_signal(desc: str):
-    d = (desc or "").upper()
-    hits = []
-    for k in ["DEMO", "DEMOL", "TEAR", "ROOF", "REMODEL", "RENOV", "ADDITION", "CONCRETE", "REMOVE", "DUMPSTER"]:
-        if k in d:
-            hits.append(k)
-    if not hits:
-        return []
-    return [{"name": "debris_generation", "confidence": 0.7, "evidence": hits[:6]}]
+    result_table = tables.nth(found_table_index)
+
+    # Extract rows (best-effort)
+    headers = []
+    rows = []
+    try:
+        # Try header cells
+        header_cells = result_table.locator("tr").first.locator("th,td")
+        hc = await header_cells.count()
+        headers = [((await header_cells.nth(j).inner_text()) or "").strip() for j in range(hc)]
+        headers = [h for h in headers if h]
+    except Exception:
+        headers = []
+
+    try:
+        tr = result_table.locator("tr")
+        rc = await tr.count()
+        for r in range(1, min(rc, 2000)):  # skip header
+            tds = tr.nth(r).locator("td")
+            c = await tds.count()
+            if c == 0:
+                continue
+            row = [((await tds.nth(j).inner_text()) or "").strip() for j in range(c)]
+            if any(row):
+                rows.append(row)
+    except Exception:
+        pass
+
+    os.makedirs("data", exist_ok=True)
+    with open("data/30_results.json", "w", encoding="utf-8") as f:
+        json.dump({"date": issued_date_mmddyyyy, "headers": headers, "rows": rows}, f, indent=2)
+
+    await snap(page, "14_results_detected")
+
+    # OPTIONAL: Click "EXPORT TO EXCEL" if present (this is usually the cleanest output)
+    # If it exists, save it as data/permits.xlsx
+    try:
+        export = page.locator("text=EXPORT TO EXCEL").first
+        if await export.count() > 0:
+            async with page.expect_download(timeout=15000) as dl_info:
+                await export.click()
+            dl = await dl_info.value
+            await dl.save_as("data/permits.xlsx")
+    except Exception:
+        # Not fatal
+        pass
+
+    # OPTIONAL: try to click next page once (since you often see 2 pages)
+    # This is best-effort; export-to-excel is preferred.
+    try:
+        # common pager patterns: ">" or "Next" links/buttons
+        next_candidates = [
+            page.locator("a[title*='Next' i]").first,
+            page.locator("a:has-text('>')").first,
+            page.locator("button:has-text('>')").first,
+            page.locator("a:has-text('Next')").first,
+        ]
+        for nxt in next_candidates:
+            if await nxt.count() > 0:
+                await nxt.click()
+                await page.wait_for_timeout(1200)
+                await snap(page, "15_page2")
+                break
+    except Exception:
+        pass
+
 
 async def main():
-    user = os.environ.get("ETRAKIT_USER", "").strip()
-    pw = os.environ.get("ETRAKIT_PASS", "").strip()
+    user = os.getenv("ETRAKIT_USER", "").strip()
+    pw = os.getenv("ETRAKIT_PASS", "").strip()
     if not user or not pw:
-        raise RuntimeError("Missing ETRAKIT_USER / ETRAKIT_PASS env vars (GitHub Secrets).")
+        raise RuntimeError("Missing ETRAKIT_USER / ETRAKIT_PASS environment variables.")
 
-    issued_date = local_yesterday_mmddyyyy()
-    run_date = datetime.utcnow().date().isoformat()
+    issued = yesterday_mmddyyyy_tz("America/New_York")
+
     os.makedirs("data", exist_ok=True)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        context = await browser.new_context(
+            viewport={"width": 1400, "height": 900},
+            accept_downloads=True
+        )
+        page = await context.new_page()
 
         try:
-            await login(page, user, pw)
-            headers, rows = await run_search(page, issued_date)
+            await login_public_portal(page, user, pw)
+            await run_permit_search(page, issued)
             await snap(page, "99_final_state")
         finally:
+            await context.close()
             await browser.close()
 
-    # Transform rows into your JSON record schema
-    out = []
-    for r in rows:
-        permit_no = r.get("PERMIT_NO") or r.get("Permit No") or r.get("PERMIT") or ""
-        issued = r.get("ISSUED") or issued_date
-        permit_type = r.get("Permit Type") or r.get("PERMIT TYPE") or ""
-        status = r.get("STATUS") or ""
-        site_addr = r.get("SITE_ADDR") or r.get("SITE ADDR") or r.get("SITE_ADDR ") or ""
-        site_apn = r.get("SITE_APN") or ""
-
-        desc = permit_type  # we’ll enrich later; right now Permit Type is the best "description-like" field
-
-        rec = {
-            "source": "etrakit",
-            "jurisdiction": "Greenville County",
-            "issued_date": issued,
-            "project": {
-                "address": site_addr,
-                "description": desc,
-                "permit_type": permit_type,
-                "value": None,
-                "site_apn": site_apn,
-                "permit_no": permit_no,
-                "status": status,
-            },
-            "contractor": {"name": None, "phone": None, "license": None},
-            "owner": {"name": None, "address": None},
-            "signals": debris_signal(desc),
-            "fingerprint": fp(issued, permit_no, site_addr, permit_type, status),
-            "source_url": SEARCH_URL,
-            "scraped_at": now_iso(),
-            "confidence": 0.75
-        }
-        out.append(rec)
-
-    path = f"data/{run_date}.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
-
-    print(f"Search ISSUED={issued_date} -> {len(out)} records -> {path}")
 
 if __name__ == "__main__":
     asyncio.run(main())
