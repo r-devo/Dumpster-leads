@@ -7,10 +7,10 @@ LOGIN_URL = f"{BASE}/eTRAKiT/login.aspx?lt=either&rd=~/Search/permit.aspx"
 SEARCH_URL = f"{BASE}/eTRAKiT/Search/permit.aspx"
 OUT_DIR = "data"
 
-# Fail-fast caps (prevents “retrying fill action” loops)
-STEP_TIMEOUT_MS = 12_000
-NAV_TIMEOUT_MS = 20_000
-ACTION_TIMEOUT_MS = 6_000
+# Fail-fast caps
+DEFAULT_TIMEOUT_MS = 6000
+NAV_TIMEOUT_MS = 12000
+ACTION_TIMEOUT_MS = 2500
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -19,14 +19,13 @@ def run_date():
     return datetime.now(timezone.utc).date().isoformat()
 
 def yesterday_mmddyyyy():
-    # good enough for daily delta; refine to ET later
     return (datetime.now() - timedelta(days=1)).strftime("%m/%d/%Y")
 
 def fp(*parts: str):
     base = "|".join([(p or "") for p in parts]).upper().encode("utf-8", errors="ignore")
     return hashlib.sha256(base).hexdigest()
 
-async def jitter(page, a=350, b=950):
+async def jitter(page, a=250, b=650):
     await page.wait_for_timeout(random.randint(a, b))
 
 async def dump(page, stem: str):
@@ -41,105 +40,108 @@ async def dump(page, stem: str):
     except Exception:
         pass
 
+async def visible(page, selector: str):
+    loc = page.locator(selector)
+    try:
+        if await loc.count() == 0:
+            return None
+        if await loc.first.is_visible():
+            return loc.first
+    except Exception:
+        return None
+    return None
+
 async def must_visible(page, selector: str, name: str):
     loc = page.locator(selector)
     try:
-        await loc.first.wait_for(state="visible", timeout=STEP_TIMEOUT_MS)
+        await loc.first.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+        return loc.first
     except Exception:
         await dump(page, f"FAIL_missing_{name}")
         raise RuntimeError(f"Missing/hidden element: {name} ({selector})")
-    return loc.first
 
-async def select_public_login_type(page):
-    """Robustly select the 'Public' login type without assuming exact label/value."""
-    ddl = await must_visible(page, "select[name='ucLogin$ddlSelLogin']", "login_type_dropdown")
+async def login_middle_public(page, user: str, pw: str) -> bool:
+    # These exist in your zip's 00_login_loaded.html
+    u = await visible(page, "#cplMain_txtPublicUserName, input[id$='txtPublicUserName']")
+    p = await visible(page, "#cplMain_txtPublicPassword, input[id$='txtPublicPassword']")
+    b = await visible(page, "#cplMain_btnPublicLogin, input[id$='btnPublicLogin'], button:has-text('Login')")
 
-    # Inspect options
+    if not (u and p and b):
+        return False
+
+    await u.fill(user, timeout=ACTION_TIMEOUT_MS)
+    await p.fill(pw, timeout=ACTION_TIMEOUT_MS)
+    await jitter(page)
+
+    try:
+        async with page.expect_navigation(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS):
+            await b.click(timeout=ACTION_TIMEOUT_MS)
+    except PWTimeout:
+        await b.click(timeout=ACTION_TIMEOUT_MS)
+
+    await jitter(page)
+    await dump(page, "01_after_middle_login_click")
+    return True
+
+async def select_public_in_header_dropdown(page):
+    # IMPORTANT: your zip shows the dropdown has ID but no name attribute
+    ddl = await must_visible(page, "select#ucLogin_ddlSelLogin", "login_type_dropdown")
+
     opts = ddl.locator("option")
     n = await opts.count()
-    if n == 0:
-        await dump(page, "FAIL_no_login_type_options")
-        raise RuntimeError("Login type dropdown has no options.")
+    chosen_value = None
+    chosen_label = None
 
-    public_value = None
-    public_label = None
     for i in range(n):
         opt = opts.nth(i)
         label = ((await opt.inner_text()) or "").strip()
         value = ((await opt.get_attribute("value")) or "").strip()
-        key = (label or value).lower()
-        # Match anything that looks like Public user
-        if "public" in key:
-            public_value = value if value else None
-            public_label = label if label else None
+        if "public" in (label.lower() + " " + value.lower()):
+            chosen_value = value if value else None
+            chosen_label = label if label else None
             break
 
-    if not (public_value or public_label):
-        # Dump options for inspection (so we never guess again)
-        option_dump = []
-        for i in range(n):
-            opt = opts.nth(i)
-            option_dump.append({
-                "label": ((await opt.inner_text()) or "").strip(),
-                "value": ((await opt.get_attribute("value")) or "").strip()
-            })
-        with open(f"{OUT_DIR}/FAIL_login_type_options.json", "w", encoding="utf-8") as f:
-            json.dump(option_dump, f, indent=2)
+    if not (chosen_value or chosen_label):
         await dump(page, "FAIL_no_public_option")
-        raise RuntimeError("Could not find a Public option in login type dropdown.")
+        raise RuntimeError("Could not find a 'Public' option in header dropdown.")
 
-    # Select by value if possible (more stable), else label
-    if public_value:
-        await ddl.select_option(value=public_value)
+    if chosen_value:
+        await ddl.select_option(value=chosen_value)
     else:
-        await ddl.select_option(label=public_label)
+        await ddl.select_option(label=chosen_label)
 
-    # Many WebForms pages require a postback for the selection to apply
-    await jitter(page, 500, 1100)
+    await jitter(page)
     try:
-        await page.wait_for_load_state("networkidle", timeout=10_000)
+        await page.wait_for_load_state("networkidle", timeout=6000)
     except PWTimeout:
         pass
-    await dump(page, "01_after_public_selected")
 
-async def login_uc(page, username: str, password: str):
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+async def login_header(page, user: str, pw: str):
+    await select_public_in_header_dropdown(page)
+    await dump(page, "01_after_header_public_selected")
+
+    u = await must_visible(page, "input#ucLogin_txtLoginId", "header_username")
+    p = await must_visible(page, "input#ucLogin_txtPassword", "header_password")
+    b = await must_visible(page, "input#ucLogin_btnLogin, button#ucLogin_btnLogin", "header_login_button")
+
+    if await u.is_disabled() or await p.is_disabled():
+        await dump(page, "FAIL_header_inputs_disabled")
+        raise RuntimeError("Header inputs disabled after selecting Public.")
+
+    await u.fill(user, timeout=ACTION_TIMEOUT_MS)
+    await p.fill(pw, timeout=ACTION_TIMEOUT_MS)
     await jitter(page)
-    await dump(page, "00_login_loaded")
 
-    await select_public_login_type(page)
-
-    # Wait until BOTH username + password are actually visible and enabled
-    user_in = await must_visible(page, "input#ucLogin_txtLoginId", "uc_username")
-    pass_in = await must_visible(page, "input#ucLogin_txtPassword", "uc_password")
-
-    # Extra: ensure not disabled
-    if (await pass_in.is_disabled()) or (await user_in.is_disabled()):
-        await dump(page, "FAIL_login_inputs_disabled")
-        raise RuntimeError("Login inputs are disabled after selecting Public (unexpected).")
-
-    btn = await must_visible(page, "input#ucLogin_btnLogin, button#ucLogin_btnLogin", "uc_login_button")
-
-    await user_in.fill(username, timeout=ACTION_TIMEOUT_MS)
-    await pass_in.fill(password, timeout=ACTION_TIMEOUT_MS)
-    await jitter(page, 250, 650)
-
-    # Click login; sometimes no navigation occurs
     try:
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS):
-            await btn.click(timeout=ACTION_TIMEOUT_MS)
+            await b.click(timeout=ACTION_TIMEOUT_MS)
     except PWTimeout:
-        await btn.click(timeout=ACTION_TIMEOUT_MS)
-
-    try:
-        await page.wait_for_load_state("networkidle", timeout=10_000)
-    except PWTimeout:
-        pass
+        await b.click(timeout=ACTION_TIMEOUT_MS)
 
     await jitter(page)
-    await dump(page, "02_after_login_click")
+    await dump(page, "02_after_header_login_click")
 
-    # Validate login by loading search page and confirming controls exist
+async def assert_logged_in(page):
     await page.goto(SEARCH_URL, wait_until="domcontentloaded")
     await jitter(page)
     await dump(page, "10_search_loaded")
@@ -151,17 +153,15 @@ async def login_uc(page, username: str, password: str):
 
 async def run_search(page, issued_date: str):
     dd_by = await must_visible(page, "select#cplMain_ddSearchBy, select#ctl00_cplMain_ddSearchBy", "search_by")
-    dd_op = await must_visible(page, "select#cplMain_ddSearchOper, select#ctl00_cplMain_ddSearchOperator", "search_operator")
+    dd_op = await must_visible(page, "select#cplMain_ddSearchOper, select#ctl00_cplMain_ddSearchOper", "search_operator")
     txt   = await must_visible(page, "#cplMain_txtSearchString, #ctl00_cplMain_txtSearchString", "search_value")
 
     await dd_by.select_option(label="ISSUED")
     await dd_op.select_option(label="Equals")
     await txt.fill(issued_date, timeout=ACTION_TIMEOUT_MS)
-
     await dump(page, "11_search_filled")
 
-    btn = await must_visible(
-        page,
+    btn = await must_visible(page,
         "#cplMain_btnSearch, #ctl00_cplMain_btnSearch, input[value='Search'], button:has-text('Search')",
         "search_button"
     )
@@ -172,12 +172,7 @@ async def run_search(page, issued_date: str):
     except PWTimeout:
         await btn.click(timeout=ACTION_TIMEOUT_MS)
 
-    try:
-        await page.wait_for_load_state("networkidle", timeout=10_000)
-    except PWTimeout:
-        pass
-
-    await jitter(page, 900, 1700)
+    await jitter(page, 700, 1400)
     await dump(page, "20_results_loaded")
 
 async def find_results_table(page):
@@ -233,18 +228,25 @@ async def main():
         browser = await p.chromium.launch(headless=True)
         ctx = await browser.new_context()
         page = await ctx.new_page()
-
-        page.set_default_timeout(STEP_TIMEOUT_MS)
+        page.set_default_timeout(DEFAULT_TIMEOUT_MS)
         page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
 
         try:
-            await login_uc(page, user, pw)
+            await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            await jitter(page)
+            await dump(page, "00_login_loaded")
+
+            used_middle = await login_middle_public(page, user, pw)
+            if not used_middle:
+                await login_header(page, user, pw)
+
+            await assert_logged_in(page)
             await run_search(page, issued)
 
             table = await find_results_table(page)
             if not table:
                 await dump(page, "FAIL_no_results_table")
-                raise RuntimeError("Results table not found. See FAIL_no_results_table.* and 20_results_loaded.*")
+                raise RuntimeError("Results table not found (see FAIL_no_results_table.* and 20_results_loaded.*).")
 
             headers, rows = await parse_table(table)
 
