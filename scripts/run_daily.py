@@ -1,264 +1,354 @@
 import os
 import re
 import json
+import csv
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
 from playwright.async_api import async_playwright
 
-
 BASE = "https://grvlc-trk.aspgov.com"
-
-# This is the login URL you showed (redirects to permit search after login)
+# This URL pattern matches what you showed and lands you on the correct login flow
 LOGIN_URL = f"{BASE}/eTRAKiT/login.aspx?lt=either&rd=~/Search/permit.aspx"
-PERMIT_SEARCH_URL = f"{BASE}/eTRAKiT/Search/permit.aspx"
+SEARCH_URL = f"{BASE}/eTRAKiT/Search/permit.aspx"
 
+OUT_DIR = "data"
 
-def yesterday_mmddyyyy_tz(tz_name: str = "America/New_York") -> str:
-    now = datetime.now(ZoneInfo(tz_name))
-    y = now - timedelta(days=1)
+def eastern_yesterday_mmddyyyy() -> str:
+    # Greenville is US/Eastern
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    y = now_et - timedelta(days=1)
     return y.strftime("%m/%d/%Y")
 
-
 async def snap(page, name: str):
-    os.makedirs("data", exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
     try:
-        await page.screenshot(path=f"data/{name}.png", full_page=True)
+        await page.screenshot(path=os.path.join(OUT_DIR, name), full_page=True)
     except Exception:
         pass
+
+async def save_html(page, name: str):
+    os.makedirs(OUT_DIR, exist_ok=True)
     try:
         html = await page.content()
-        with open(f"data/{name}.html", "w", encoding="utf-8") as f:
+        with open(os.path.join(OUT_DIR, name), "w", encoding="utf-8") as f:
             f.write(html)
     except Exception:
         pass
 
+async def find_public_login_box(page):
+    """
+    Prefer the middle 'Public Login' panel (what you described).
+    We identify it by visible text and then find username/password inputs inside it.
+    """
+    # Look for a region containing "Public Login" and "LOG IN BELOW..."
+    box = page.locator("text=Public Login").first
+    if await box.count() == 0:
+        # fallback: phrase on the page
+        box = page.locator("text=LOG IN BELOW TO ENTER THE PUBLIC PORTAL").first
 
-async def login_public_portal(page, username: str, password: str):
+    if await box.count() == 0:
+        return None
+
+    # Get a reasonably-sized container around that text
+    container = box.locator("xpath=ancestor-or-self::*[self::div or self::td or self::table][1]")
+    if await container.count() == 0:
+        container = box
+
+    return container
+
+async def login(page, username: str, password: str):
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(500)
-    await snap(page, "00_login_loaded")
+    await snap(page, "00_login_loaded.png")
 
-    # IMPORTANT: Use the *Public Login box in the middle* (cplMain_* ids),
-    # not the header Telerik/Rad login fields.
-    user = page.locator("#cplMain_txtPublicUserName")
-    pw = page.locator("#cplMain_txtPublicPassword")
-    btn = page.locator("#cplMain_btnPublicLogin")
+    container = await find_public_login_box(page)
+    if container is None:
+        # fallback to the first visible form on the page with a password field
+        container = page.locator("form").filter(has=page.locator("input[type=password]")).first
 
-    await user.wait_for(state="visible", timeout=15000)
-    await pw.wait_for(state="visible", timeout=15000)
-    await btn.wait_for(state="visible", timeout=15000)
+    # Find *visible* inputs inside the chosen container
+    user_input = container.locator("input[type=text], input[type=email]").filter(
+        has_not=container.locator("[type=hidden]")
+    ).filter(
+        has_not=container.locator("[disabled]")
+    ).filter(
+        has_not=container.locator("[readonly]")
+    ).filter(
+        has=page.locator(":visible")
+    ).first
 
-    await user.fill(username)
-    await pw.fill(password)
+    pass_input = container.locator("input[type=password]").filter(
+        has_not=container.locator("[type=hidden]")
+    ).filter(
+        has_not=container.locator("[disabled]")
+    ).filter(
+        has_not=container.locator("[readonly]")
+    ).first
 
-    # Click login and wait for navigation / logged-in markers
-    async with page.expect_navigation(wait_until="domcontentloaded", timeout=20000):
-        await btn.click()
+    # Ensure they’re actually visible (this avoids the “resolved to hidden input” failure)
+    await user_input.wait_for(state="visible", timeout=15000)
+    await pass_input.wait_for(state="visible", timeout=15000)
 
+    await user_input.fill(username)
+    await pass_input.fill(password)
+
+    # Click the visible LOGIN button near that container
+    login_btn = container.locator("button, input[type=submit], input[type=button]").filter(
+        has_text=re.compile(r"\blog\s*in\b|\bsign\s*in\b|\blogin\b", re.I)
+    ).first
+
+    if await login_btn.count() == 0:
+        # fallback: any element literally labeled LOGIN
+        login_btn = page.locator("text=LOGIN").first
+
+    await login_btn.click()
+    await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(800)
-    await snap(page, "01_after_login")
 
-    # Confirm we're actually logged in
-    # The permit search page shows "LOGGED IN AS: RIDGE DEVUONO" (from your screenshot).
-    # If this doesn't appear, treat as login failure.
-    logged_in_marker = page.locator("text=LOGGED IN AS").first
-    logout_marker = page.locator("text=LOG OUT").first
+    await snap(page, "01_after_login.png")
 
-    if await logged_in_marker.count() == 0 and await logout_marker.count() == 0:
-        # Sometimes it lands on a page that still requires redirect; try direct.
-        await page.goto(PERMIT_SEARCH_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(800)
+    # Confirm logged-in state by looking for "LOG OUT" or "LOGGED IN AS"
+    if await page.locator("text=LOG OUT").count() == 0 and await page.locator("text=LOGGED IN AS").count() == 0:
+        # Not necessarily fatal, but give a strong diagnostic
+        await save_html(page, "01_after_login.html")
+        raise RuntimeError("Login did not appear to complete (no LOG OUT / LOGGED IN AS found).")
 
-    await snap(page, "02_after_login_or_redirect")
+async def find_search_by_select(page):
+    """
+    Finds the 'Search By' dropdown on the permit search page.
+    We search all <select> elements and choose the one that has options like PERMIT_NO and ISSUED.
+    """
+    selects = page.locator("select")
+    n = await selects.count()
+    best = None
 
-    if await logged_in_marker.count() == 0 and await logout_marker.count() == 0:
-        raise RuntimeError("Login did not appear successful (no LOGGED IN AS / LOG OUT found).")
-
-
-async def run_permit_search(page, issued_date_mmddyyyy: str):
-    # Ensure we're on the permit search page
-    await page.goto(PERMIT_SEARCH_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(800)
-    await snap(page, "10_search_page_loaded")
-
-    # These IDs exist on the permit search HTML from your successful logged-in artifact:
-    # - Search By dropdown: cplMain_ddSearchBy
-    # - Operator dropdown: cplMain_ddSearchOper
-    # - Search string input: cplMain_txtSearchString
-    # - Search button: ctl00_cplMain_btnSearch
-    search_by = page.locator("#cplMain_ddSearchBy")
-    oper = page.locator("#cplMain_ddSearchOper")
-    val = page.locator("#cplMain_txtSearchString")
-    btn = page.locator("#ctl00_cplMain_btnSearch")
-
-    await search_by.wait_for(state="visible", timeout=15000)
-    await oper.wait_for(state="visible", timeout=15000)
-    await val.wait_for(state="visible", timeout=15000)
-    await btn.wait_for(state="visible", timeout=15000)
-
-    # Select ISSUED in "Search By"
-    # Option values on the site are uppercase like ISSUED, PERMIT_NO, etc.
-    # We'll try by value first, then by label fallback.
-    try:
-        await search_by.select_option(value="ISSUED")
-    except Exception:
-        # Fallback: find any option whose label contains "issued"
-        options = await search_by.locator("option").all()
-        chosen = None
-        for opt in options:
-            t = (await opt.text_content()) or ""
-            v = (await opt.get_attribute("value")) or ""
-            if "issued" in t.lower() or v.upper() == "ISSUED":
-                chosen = v
+    for i in range(n):
+        sel = selects.nth(i)
+        try:
+            # Collect option texts quickly
+            opts = await sel.locator("option").all_inner_texts()
+            opts_u = [o.strip().upper() for o in opts if o and o.strip()]
+            if "PERMIT_NO" in opts_u and ("ISSUED" in opts_u or any("ISSU" in x for x in opts_u)):
+                best = sel
                 break
-        if not chosen:
-            raise RuntimeError("Could not find ISSUED option in Search By dropdown.")
-        await search_by.select_option(value=chosen)
+        except Exception:
+            continue
 
-    # Operator stays equals (but enforce it)
-    try:
-        await oper.select_option(value="EQUALS")
-    except Exception:
-        # Fallback by label
-        await oper.select_option(label="Equals")
+    if best is not None:
+        return best
 
-    # Fill date
-    await val.fill(issued_date_mmddyyyy)
+    # Fallback: locate by nearby label text "Search By"
+    label = page.locator("text=Search By").first
+    if await label.count() > 0:
+        nearby = label.locator("xpath=following::select[1]")
+        if await nearby.count() > 0:
+            return nearby
 
-    await snap(page, "11_before_search_click")
+    raise RuntimeError("Could not locate Search By dropdown.")
 
-    # Click search and wait until results area appears
-    await btn.click()
-    await page.wait_for_timeout(1200)
-    await snap(page, "12_after_search_click")
+async def find_search_value_input(page):
+    """
+    Finds the 'Search Value' input on the permit search page.
+    """
+    # Prefer label-based adjacency
+    label = page.locator("text=Search Value").first
+    if await label.count() > 0:
+        inp = label.locator("xpath=following::input[1]")
+        if await inp.count() > 0:
+            return inp
 
-    # Wait for the results table headers you showed: PERMIT_NO / ISSUED / Permit Type / STATUS / SITE_APN / SITE_ADDR
-    # Sometimes header casing varies; check loosely.
-    await page.wait_for_timeout(800)
-    await snap(page, "13_post_wait")
+    # fallback: first visible text input in the main content area
+    inp = page.locator("input[type=text]").filter(has=page.locator(":visible")).first
+    if await inp.count() == 0:
+        raise RuntimeError("Could not locate Search Value input.")
+    return inp
 
-    # Try to locate a table that contains PERMIT_NO and ISSUED somewhere near the header row
+async def find_results_table(page):
+    """
+    Find the results grid by looking for a table that contains the PERMIT_NO header.
+    """
     tables = page.locator("table")
-    tcount = await tables.count()
+    n = await tables.count()
+    for i in range(n):
+        t = tables.nth(i)
+        try:
+            if await t.locator("th").filter(has_text=re.compile(r"PERMIT_NO", re.I)).count() > 0:
+                return t
+        except Exception:
+            continue
+    raise RuntimeError("Results table not found (no table with PERMIT_NO header).")
 
-    def looks_like_header(txt: str) -> bool:
-        txt_u = txt.upper()
-        return ("PERMIT_NO" in txt_u) and ("ISSUED" in txt_u) and ("SITE_ADDR" in txt_u)
+async def extract_table(table):
+    headers = await table.locator("th").all_inner_texts()
+    headers = [h.strip() for h in headers if h and h.strip()]
 
-    found_table_index = None
-    for i in range(tcount):
-        txt = (await tables.nth(i).inner_text()) or ""
-        if looks_like_header(txt):
-            found_table_index = i
-            break
-
-    if found_table_index is None:
-        # Dump a quick report for debugging
-        report = {"issued_date": issued_date_mmddyyyy, "table_count": tcount, "tables": []}
-        for i in range(min(tcount, 25)):
-            txt = (await tables.nth(i).inner_text()) or ""
-            preview = " ".join(txt.split())[:240]
-            report["tables"].append({"i": i, "preview": preview})
-        os.makedirs("data", exist_ok=True)
-        with open("data/20_table_report.json", "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
-        raise RuntimeError("Results table not found after search. See data/12_after_search_click.png and data/20_table_report.json")
-
-    result_table = tables.nth(found_table_index)
-
-    # Extract rows (best-effort)
-    headers = []
     rows = []
-    try:
-        # Try header cells
-        header_cells = result_table.locator("tr").first.locator("th,td")
-        hc = await header_cells.count()
-        headers = [((await header_cells.nth(j).inner_text()) or "").strip() for j in range(hc)]
-        headers = [h for h in headers if h]
-    except Exception:
-        headers = []
+    tr = table.locator("tbody tr")
+    rn = await tr.count()
+    for i in range(rn):
+        tds = tr.nth(i).locator("td")
+        cells = await tds.all_inner_texts()
+        cells = [c.strip() for c in cells]
+        if any(cells):
+            rows.append(cells)
 
-    try:
-        tr = result_table.locator("tr")
-        rc = await tr.count()
-        for r in range(1, min(rc, 2000)):  # skip header
-            tds = tr.nth(r).locator("td")
-            c = await tds.count()
-            if c == 0:
-                continue
-            row = [((await tds.nth(j).inner_text()) or "").strip() for j in range(c)]
-            if any(row):
-                rows.append(row)
-    except Exception:
-        pass
+    return headers, rows
 
-    os.makedirs("data", exist_ok=True)
-    with open("data/30_results.json", "w", encoding="utf-8") as f:
-        json.dump({"date": issued_date_mmddyyyy, "headers": headers, "rows": rows}, f, indent=2)
+async def goto_search_page(page):
+    await page.goto(SEARCH_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(800)
+    await snap(page, "10_search_page_loaded.png")
 
-    await snap(page, "14_results_detected")
+    # Confirm we’re on Permit Search page
+    if await page.locator("text=Permit Search").count() == 0:
+        await save_html(page, "10_search_page_loaded.html")
+        raise RuntimeError("Did not reach Permit Search page (missing 'Permit Search' text).")
 
-    # OPTIONAL: Click "EXPORT TO EXCEL" if present (this is usually the cleanest output)
-    # If it exists, save it as data/permits.xlsx
-    try:
-        export = page.locator("text=EXPORT TO EXCEL").first
-        if await export.count() > 0:
-            async with page.expect_download(timeout=15000) as dl_info:
-                await export.click()
-            dl = await dl_info.value
-            await dl.save_as("data/permits.xlsx")
-    except Exception:
-        # Not fatal
-        pass
+async def submit_issued_yesterday_search(page, issued_date: str):
+    sel = await find_search_by_select(page)
+    await sel.wait_for(state="visible", timeout=15000)
 
-    # OPTIONAL: try to click next page once (since you often see 2 pages)
-    # This is best-effort; export-to-excel is preferred.
-    try:
-        # common pager patterns: ">" or "Next" links/buttons
-        next_candidates = [
-            page.locator("a[title*='Next' i]").first,
-            page.locator("a:has-text('>')").first,
-            page.locator("button:has-text('>')").first,
-            page.locator("a:has-text('Next')").first,
-        ]
-        for nxt in next_candidates:
-            if await nxt.count() > 0:
-                await nxt.click()
-                await page.wait_for_timeout(1200)
-                await snap(page, "15_page2")
-                break
-    except Exception:
-        pass
+    # Select ISSUED (robustly)
+    opts = await sel.locator("option").all_inner_texts()
+    target_label = None
+    for o in opts:
+        if o and "ISSUED" in o.upper():
+            target_label = o
+            break
+    if target_label is None:
+        raise RuntimeError("Search By dropdown does not contain ISSUED option.")
 
+    await sel.select_option(label=target_label)
+
+    # Fill search value with yesterday date
+    val = await find_search_value_input(page)
+    await val.wait_for(state="visible", timeout=15000)
+    await val.fill(issued_date)
+
+    # Click SEARCH button
+    btn = page.locator("button, input[type=submit], input[type=button]").filter(
+        has_text=re.compile(r"\bsearch\b", re.I)
+    ).first
+    await btn.wait_for(state="visible", timeout=15000)
+    await btn.click()
+
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(1200)
+
+async def click_next_page_if_exists(page) -> bool:
+    """
+    Click the 'next page' control if pagination exists (like your screenshot).
+    Returns True if it navigated to page 2.
+    """
+    # If the page text already says "page 1 of 2", there should be a pager.
+    pager_text = page.locator("text=page 1 of").first
+    if await pager_text.count() == 0:
+        return False
+
+    # Best: a control that does a Page$Next postback
+    next_candidate = page.locator("[onclick*='Page$Next'], [href*='Page$Next']").first
+    if await next_candidate.count() > 0:
+        await next_candidate.click()
+    else:
+        # Fallback: click the third pager button in the pager cluster (first, prev, next, last)
+        # We find a row of small image buttons near the "page 1 of 2" text.
+        cluster = pager_text.locator("xpath=preceding::input[@type='image'][4]")
+        if await cluster.count() > 0:
+            # Not reliable indexing from this anchor; fallback to grabbing all image buttons and clicking the "next-ish" one.
+            imgs = page.locator("input[type='image']")
+            if await imgs.count() >= 3:
+                await imgs.nth(2).click()
+            else:
+                return False
+        else:
+            imgs = page.locator("input[type='image']")
+            if await imgs.count() >= 3:
+                await imgs.nth(2).click()
+            else:
+                return False
+
+    # Wait until page 2 text appears or table refresh happens
+    await page.wait_for_timeout(700)
+    page2 = page.locator("text=page 2 of").first
+    if await page2.count() > 0:
+        return True
+
+    # Give it a bit more time
+    await page.wait_for_timeout(1200)
+    return (await page.locator("text=page 2 of").count()) > 0
+
+def write_csv(path, headers, rows):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        if headers:
+            w.writerow(headers)
+        for r in rows:
+            w.writerow(r)
 
 async def main():
-    user = os.getenv("ETRAKIT_USER", "").strip()
-    pw = os.getenv("ETRAKIT_PASS", "").strip()
+    user = os.getenv("ETRAKIT_USER", "")
+    pw = os.getenv("ETRAKIT_PASS", "")
     if not user or not pw:
         raise RuntimeError("Missing ETRAKIT_USER / ETRAKIT_PASS environment variables.")
 
-    issued = yesterday_mmddyyyy_tz("America/New_York")
-
-    os.makedirs("data", exist_ok=True)
+    issued_date = eastern_yesterday_mmddyyyy()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            viewport={"width": 1400, "height": 900},
-            accept_downloads=True
-        )
+        context = await browser.new_context()
         page = await context.new_page()
 
         try:
-            await login_public_portal(page, user, pw)
-            await run_permit_search(page, issued)
-            await snap(page, "99_final_state")
+            await login(page, user, pw)
+            await goto_search_page(page)
+
+            await submit_issued_yesterday_search(page, issued_date)
+            await snap(page, "14_results_detected.png")
+
+            table = await find_results_table(page)
+            headers, rows1 = await extract_table(table)
+
+            # Try to grab page 2 if it exists
+            has_page2 = await click_next_page_if_exists(page)
+            rows2 = []
+            if has_page2:
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(1000)
+                await snap(page, "15_page2.png")
+                table2 = await find_results_table(page)
+                _, rows2 = await extract_table(table2)
+
+            # Merge + dedupe rows
+            all_rows = rows1 + rows2
+            seen = set()
+            deduped = []
+            for r in all_rows:
+                key = tuple([c.strip() for c in r])
+                if key not in seen and any(key):
+                    seen.add(key)
+                    deduped.append(r)
+
+            os.makedirs(OUT_DIR, exist_ok=True)
+            write_csv(os.path.join(OUT_DIR, "permits.csv"), headers, deduped)
+
+            meta = {
+                "issued_date": issued_date,
+                "rows_page1": len(rows1),
+                "rows_page2": len(rows2),
+                "rows_total": len(deduped),
+                "had_page2": bool(has_page2),
+                "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            }
+            with open(os.path.join(OUT_DIR, "30_results.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+
+            await snap(page, "99_final_state.png")
+
         finally:
             await context.close()
             await browser.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
